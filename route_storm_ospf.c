@@ -818,9 +818,10 @@ int ospf_process_exchange_steps(ospf_session_t *s, uint8_t pid)
 
       case 7: /* Waiting to send LSU */
         printf("[OSPF PID%u] Step 7: Sending LSU\n", pid);
-        struct ospf_lsa_header lsa;
-        ospf_generate_router_lsa(s, &lsa, if_idx);
-        struct ospf_lsa_header *lsa_ptr = &lsa;
+        uint8_t lsa_buf[OSPF_MAX_LSA_SIZE];
+        struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
+        ospf_generate_router_lsa(s, lsa, if_idx);
+        struct ospf_lsa_header *lsa_ptr = lsa;
         ospf_send_lsu_packet(pid, s, string_to_ip("1.1.1.1"),
             LSA_TYPE_ROUTER, 1, &lsa_ptr, if_idx);
         iface->exchange_state.step = 8;
@@ -1196,9 +1197,10 @@ int ospf_handle_lsr_packet(struct ospf_header *hdr,
 
   /* Send LSU response immediately */
   printf("[OSPF PID%u] Sending LSU response immediately\n", pid);
-  struct ospf_lsa_header lsa;
-  ospf_generate_router_lsa(s, &lsa, iface_index);
-  struct ospf_lsa_header *lsa_ptr = &lsa;
+  uint8_t lsa_buf[OSPF_MAX_LSA_SIZE];
+  struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
+  ospf_generate_router_lsa(s, lsa, iface_index);
+  struct ospf_lsa_header *lsa_ptr = lsa;
   ospf_send_lsu_packet(pid, s, remote_rid, LSA_TYPE_ROUTER, 1, &lsa_ptr, iface_index);
 
   return 0;
@@ -1394,6 +1396,7 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
   uint32_t area_id = string_to_ip("0.0.0.0");
   uint64_t hello_cycles;
   uint64_t last_periodic_hello = 0;
+  uint64_t last_stats_display = 0;
 
   printf("\n=== Starting OSPF Test on PID %u, Core %u ===\n", pid, lid);
 
@@ -1460,7 +1463,12 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
     /* Process neighbor timeouts */
     ospf_process_neighbor_timeouts(s, pid);
 
-    if (s->sim_routes_count > 0) {
+    if (now - last_stats_display > 10 * rte_get_tsc_hz()) {
+        ospf_display_stats(pid);
+        last_stats_display = now;
+    }
+
+    if (s->sim_routes_count > 0 && !s->sim_routes_advertised) {
         for (uint32_t i = 0; i < s->sim_routes_count; i++) {
             uint8_t lsa_buf[OSPF_MAX_LSA_SIZE] = {0};
             struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
@@ -1477,6 +1485,7 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
                 }
             }
         }
+        s->sim_routes_advertised = 1;
     }
 
     if(s->dirty_lsa) {
@@ -1622,4 +1631,34 @@ int ospf_generate_external_lsa(ospf_session_t *s, struct ospf_lsa_header *lsa, u
     hdr->checksum = ospf_lsa_checksum(hdr);
 
     return 0;
+}
+void ospf_run_spf(ospf_session_t *s) {
+    if (!s) return;
+
+    s->spf_run_count++;
+
+    printf("[OSPF PID%u] SPF calculation #%lu\n", s->pid, s->spf_run_count);
+}
+void ospf_display_stats(uint8_t pid) {
+    if (pid >= RTE_MAX_ETHPORTS) return;
+
+    ospf_session_t *s = &ospf_sessions[pid];
+    printf("\n--- OSPF Stats for PID %u ---\n", pid);
+    printf("Router ID: %s\n", ip_to_string(s->router_id));
+    printf("Neighbors:\n");
+    for (int i = 0; i < s->neighbor_count; i++) {
+        ospf_neighbor_t *n = &s->neighbors[i];
+        printf("  - %s: %s\n", ip_to_string(n->router_id), ospf_state_to_string(n->state));
+    }
+    printf("Packet Stats (TX/RX):\n");
+    printf("  Hello: %lu/%lu\n", s->config.hello_sent, s->config.hello_received);
+    printf("  DD:    %lu/%lu\n", s->config.dd_sent, s->config.dd_received);
+    printf("  LSR:   %lu/%lu\n", s->config.lsr_sent, s->config.lsr_received);
+    printf("  LSU:   %lu/%lu\n", s->config.lsu_sent, s->config.lsu_received);
+    printf("  LSAck: %lu/%lu\n", s->config.lsack_sent, s->config.lsack_received);
+    printf("DB Counts:\n");
+    printf("  LSDB: %d\n", rte_hash_count(s->lsdb));
+    printf("  RIB:  %d\n", rte_hash_count(s->rib));
+    printf("  FIB:  %d\n", rte_hash_count(s->fib));
+    printf("-------------------------\n");
 }

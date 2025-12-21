@@ -246,6 +246,7 @@ typedef struct {
     uint32_t sim_routes_count;
     uint32_t sim_routes_start;
     uint64_t spf_run_count;
+    uint8_t sim_routes_advertised;
 } ospf_session_t;
 
 /* Helper / API */
@@ -314,5 +315,6 @@ int ospf_process_exchange_steps(ospf_session_t *s, uint8_t pid);
 
 /* Main test loop */
 int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid);
+void ospf_display_stats(uint8_t pid);
 
 #endif /* ROUTE_STORM_OSPF_H */
