@@ -1,0 +1,1550 @@
+#include "route_storm_ospf.h"
+#include "aticara.h"
+#include "misc.h"
+#include "headers.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <arpa/inet.h>
+
+#include <rte_mempool.h>
+#include <rte_ethdev.h>
+#include <rte_cycles.h>
+#include <rte_ip.h>
+#include <rte_udp.h>
+#include <rte_jhash.h>
+
+/* Globals */
+ospf_session_t ospf_sessions[RTE_MAX_ETHPORTS];
+
+/* ---------- Helpers ---------- */
+
+const char* ip_to_string(uint32_t ip_net)
+{
+  static char buf[4][16];
+  static int idx = 0;
+  char *out = buf[idx];
+  idx = (idx + 1) % 4;
+
+  uint32_t ip = ntohl(ip_net);
+  snprintf(out, 16, "%u.%u.%u.%u",
+      (ip >> 24) & 0xff,
+      (ip >> 16) & 0xff,
+      (ip >> 8)  & 0xff,
+      ip & 0xff);
+  return out;
+}
+
+const char* ospf_state_to_string(ospf_state_t s)
+{
+  static const char *names[] = {
+    "DOWN","ATTEMPT","INIT","2-WAY",
+    "EXSTART","EXCHANGE","LOADING","FULL"
+  };
+  if (s > OSPF_STATE_FULL) return "UNKNOWN";
+  return names[s];
+}
+
+uint32_t string_to_ip(const char *s)
+{
+  struct in_addr a;
+  if (inet_pton(AF_INET, s, &a) != 1) {
+    printf("Invalid IP string: %s\n", s);
+    return 0;
+  }
+  return a.s_addr; /* network order */
+}
+
+/* ---------- Hash table helper ---------- */
+
+struct rte_hash* ospf_create_hash_table(const char *name, uint32_t entries)
+{
+  struct rte_hash_parameters p = {
+    .name = name,
+    .entries = entries,
+    .key_len = sizeof(uint64_t),
+    .hash_func = rte_jhash,
+    .hash_func_init_val = 0,
+    .socket_id = rte_socket_id()
+  };
+  struct rte_hash *h = rte_hash_create(&p);
+  if (!h) {
+    printf("Failed to create hash '%s'\n", name);
+  } else {
+    printf("Successfully created hash table '%s' with %u entries\n",
+        name, entries);
+  }
+  return h;
+}
+
+/* ---------- Checksums ---------- */
+
+uint16_t ospf_checksum(struct ospf_header *hdr, uint16_t length)
+{
+  uint32_t sum = 0;
+  uint16_t saved = hdr->checksum;
+
+  hdr->checksum = 0;
+  uint8_t *data = (uint8_t *)hdr;
+
+  for (uint16_t i = 0; i < length; i += 2) {
+    uint16_t w = data[i] << 8;
+    if (i + 1 < length) w |= data[i+1];
+    sum += w;
+  }
+  while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+
+  hdr->checksum = saved;
+  return (uint16_t)(~sum);
+}
+
+uint16_t ospf_lsa_checksum(struct ospf_lsa_header *lsa) {
+    uint16_t saved_checksum = lsa->checksum;
+    lsa->checksum = 0;
+
+    int len = ntohs(lsa->length);
+    uint8_t *data = (uint8_t *)lsa;
+
+    // Start from byte 2 (options field), skipping LS Age
+    uint8_t *p = data + 2;
+    int data_len = len - 2;
+
+    uint32_t c0 = 0, c1 = 0;
+    int i;
+    for (i = 0; i < data_len; i++) {
+        c0 = c0 + p[i];
+        c1 += c0;
+    }
+    c0 %= 255;
+    c1 %= 255;
+
+    int x = (data_len * c0 - c1) % 255;
+    if (x <= 0) {
+        x += 255;
+    }
+    int y = 510 - c0 - x;
+    if (y > 255) {
+        y -= 255;
+    }
+
+    uint16_t checksum = (x << 8) | y;
+
+    lsa->checksum = saved_checksum;
+
+    return checksum;
+}
+
+/* ---------- Cleanup / init ---------- */
+
+void ospf_cleanup_session(uint8_t pid)
+{
+  if (pid >= RTE_MAX_ETHPORTS) return;
+
+  ospf_session_t *s = &ospf_sessions[pid];
+
+  printf("Cleaning up OSPF session for PID %u\n", pid);
+
+  if (s->lsdb) { rte_hash_free(s->lsdb); s->lsdb = NULL; }
+  if (s->rib)  { rte_hash_free(s->rib);  s->rib  = NULL; }
+  if (s->fib)  { rte_hash_free(s->fib);  s->fib  = NULL; }
+
+  memset(s, 0, sizeof(*s));
+  s->pid = pid;
+  s->state = OSPF_STATE_DOWN;
+}
+
+/*
+ * Basic Configuration of Interface - FIXED AS POINT-TO-POINT
+ * */
+int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
+{
+  ospf_cleanup_session(pid);
+
+  ospf_session_t *s = &ospf_sessions[pid];
+  memset(s, 0, sizeof(*s));
+  s->pid = pid;
+  s->lid = rte_lcore_id();
+
+  /* Set Router IDs based on your topology */
+  if (router_id == 0) {
+    switch (pid) {
+      case 0: s->router_id = string_to_ip("2.2.2.2"); break;    /* Your router PID 0 */
+      case 1: s->router_id = string_to_ip("3.3.3.3"); break;    /* Your router PID 1 */
+      default: s->router_id = string_to_ip("192.168.99.100"); break;
+    }
+  } else {
+    s->router_id = router_id;  /* Use provided Router ID */
+  }
+
+  s->area_id   = area_id ? area_id : string_to_ip("0.0.0.0");
+  s->state = OSPF_STATE_DOWN;
+
+  s->config.router_id = s->router_id;
+  s->config.area_id   = s->area_id;
+  s->config.hello_interval = OSPF_HELLO_INTERVAL;
+  s->config.dead_interval  = OSPF_DEAD_INTERVAL;
+  s->config.priority = 0;  /* Priority 0 for point-to-point (no DR election) */
+  s->config.options  = OSPF_OPTION_E;
+  s->config.network_mask = string_to_ip("255.255.255.0");
+  s->config.designated_router = 0;
+  s->config.backup_dr = 0;
+
+  /* Initialize interfaces based on your topology */
+  s->interface_count = 1;  /* Each PID has 1 interface */
+
+  if (pid == 0) {
+    /* PID 0: Interface connected to FRR port 1 (192.168.1.1) */
+    ospf_interface_t *iface = &s->interfaces[0];
+    memset(iface, 0, sizeof(*iface));
+    iface->ip_address = string_to_ip("192.168.1.100");
+    iface->network_mask = s->config.network_mask;
+    iface->area_id = s->area_id;
+    iface->type = OSPF_IFTYPE_P2P;  /* FIXED: POINT-TO-POINT */
+    iface->hello_interval = OSPF_HELLO_INTERVAL;
+    iface->dead_interval  = OSPF_DEAD_INTERVAL;
+    iface->priority = 0;  /* Priority 0 for point-to-point */
+    iface->options  = OSPF_OPTION_E;
+    iface->cost = 10;
+    iface->state = 1;  /* up */
+    iface->designated_router = 0;
+    iface->backup_dr = 0;
+    iface->is_passive = 0;  /* Active interface */
+    printf("[OSPF PID%u] Configured interface as POINT-TO-POINT (not BROADCAST)\n", pid);
+  } else if (pid == 1) {
+    /* PID 1: Interface connected to FRR port 2 (192.168.2.1) */
+    ospf_interface_t *iface = &s->interfaces[0];
+    memset(iface, 0, sizeof(*iface));
+    iface->ip_address = string_to_ip("192.168.2.100");
+    iface->network_mask = s->config.network_mask;
+    iface->area_id = s->area_id;
+    iface->type = OSPF_IFTYPE_P2P;  /* FIXED: POINT-TO-POINT */
+    iface->hello_interval = OSPF_HELLO_INTERVAL;
+    iface->dead_interval  = OSPF_DEAD_INTERVAL;
+    iface->priority = 0;  /* Priority 0 for point-to-point */
+    iface->options  = OSPF_OPTION_E;
+    iface->cost = 10;
+    iface->state = 1;  /* up */
+    iface->designated_router = 0;
+    iface->backup_dr = 0;
+    iface->is_passive = 0;  /* Active interface */
+    printf("[OSPF PID%u] Configured interface as POINT-TO-POINT (not BROADCAST)\n", pid);
+  }
+
+  char lsdb_name[32], rib_name[32], fib_name[32];
+  snprintf(lsdb_name, sizeof(lsdb_name), "lsdb_%u", pid);
+  snprintf(rib_name, sizeof(rib_name), "rib_%u", pid);
+  snprintf(fib_name, sizeof(fib_name), "fib_%u", pid);
+
+  s->lsdb = ospf_create_hash_table(lsdb_name, 512);
+  s->rib  = ospf_create_hash_table(rib_name, 1024);
+  s->fib  = ospf_create_hash_table(fib_name, 1024);
+
+  if (!s->lsdb || !s->rib || !s->fib) {
+    printf("Failed to create OSPF hash tables for PID %u\n", pid);
+    ospf_cleanup_session(pid);
+    return -1;
+  }
+
+  printf("OSPF Test Initialized for PID %u:\n", pid);
+  printf("  Router ID: %s\n", ip_to_string(s->router_id));
+  printf("  Area: %s\n", ip_to_string(s->area_id));
+  printf("  Interface: %s/%s (Point-to-Point)\n",
+      ip_to_string(s->interfaces[0].ip_address),
+      ip_to_string(s->config.network_mask));
+  printf("  Interface Type: POINT-TO-POINT (no DR/BDR election)\n");
+
+  return 0;
+}
+
+/* ---------- TX: generic OSPF packet ---------- */
+
+int ospf_send_packet(uint8_t pid, ospf_session_t *s, uint8_t type,
+    void *payload, uint16_t payload_len, uint32_t dst_ip,
+    uint32_t src_ip)
+{
+  port_info_t *info = &aticara.info[pid];
+  uint8_t lid = rte_lcore_id();
+  int qid = wr_get_txque(aticara.l2p, lid, pid);
+
+  struct rte_mbuf *m = rte_pktmbuf_alloc(info->q[qid].tx_mp);
+  if (!m) {
+    PRINT_LOG("OSPF: failed to alloc mbuf for type %u\n", type);
+    return -1;
+  }
+
+  uint16_t ospf_len = sizeof(struct ospf_header) + payload_len;
+  uint16_t ip_len   = sizeof(struct iphdr) + ospf_len;
+  uint16_t frame_len = sizeof(struct ethernet_hdr) + ip_len;
+
+  rte_pktmbuf_append(m, frame_len);
+
+  struct ethernet_hdr *eth = rte_pktmbuf_mtod(m, struct ethernet_hdr *);
+  struct iphdr *ip = (struct iphdr *)(eth + 1);
+  struct ospf_header *hdr = (struct ospf_header *)(ip + 1);
+
+  /* Ethernet */
+  uint8_t dst_mac[6];
+
+  /* Use broadcast MAC for simplicity in test environment */
+  uint8_t broadcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+  memcpy(dst_mac, broadcast_mac, 6);
+
+  uint8_t src_mac[6];
+  switch (pid) {
+    case 0: memcpy(src_mac, (uint8_t[]){0x00,0x11,0x22,0x33,0x44,0x01}, 6); break;
+    case 1: memcpy(src_mac, (uint8_t[]){0x00,0x11,0x22,0x33,0x44,0x02}, 6); break;
+    default: memcpy(src_mac, (uint8_t[]){0x00,0x11,0x22,0x33,0x44,0x99}, 6); break;
+  }
+
+  memcpy(eth->ether_dhost, dst_mac, 6);
+  memcpy(eth->ether_shost, src_mac, 6);
+  eth->ether_type = htons(ETHERTYPE_IP);
+
+  /* IP header */
+  memset(ip, 0, sizeof(*ip));
+  ip->version = 4;
+  ip->ihl = 5;
+  ip->tos = 0xc0;
+  ip->tot_len = htons(ip_len);
+  ip->id = htons((uint16_t)(rte_rand() & 0xffff));
+  ip->frag_off = htons(IP_DF);
+  ip->ttl = 1;
+  ip->protocol = OSPF_PROTOCOL_NUMBER;
+  ip->saddr = src_ip;
+  ip->daddr = dst_ip;
+  ip->check = ipchksum((uint16_t *)ip, sizeof(*ip));
+
+  /* OSPF header */
+  memset(hdr, 0, sizeof(*hdr));
+  hdr->version  = OSPF_VERSION;
+  hdr->type     = type;
+  hdr->router_id = s->router_id;   /* net order */
+  hdr->area_id   = s->area_id;     /* net order */
+  hdr->auth_type = 0;
+  hdr->auth_data = 0;
+  hdr->length    = htons(ospf_len);
+
+  if (payload && payload_len)
+    memcpy(hdr + 1, payload, payload_len);
+
+  hdr->checksum = htons(ospf_checksum(hdr, ospf_len));
+
+  m->pkt_len  = frame_len;
+  m->data_len = frame_len;
+
+  send_mbuf(m, pid, qid);
+
+  if (pblast[pid].trafficCapture) {
+    pblast_pcapdump(pid, (const u_char *)eth, frame_len);
+  }
+
+  const char *tname = "Unknown";
+  switch (type) {
+    case OSPF_TYPE_HELLO: tname = "Hello"; break;
+    case OSPF_TYPE_DD:    tname = "DD";    break;
+    case OSPF_TYPE_LSR:   tname = "LSR";   break;
+    case OSPF_TYPE_LSU:   tname = "LSU";   break;
+    case OSPF_TYPE_LSACK: tname = "LSAck"; break;
+  }
+
+  printf("[OSPF PID%u] >>> SENT: %s from Router %s (%s) to %s, length=%u bytes\n",
+      pid, tname, ip_to_string(s->router_id),
+      ip_to_string(src_ip), ip_to_string(dst_ip), frame_len);
+
+  switch (type) {
+    case OSPF_TYPE_HELLO:
+      s->config.hello_sent++;
+      s->last_hello_sent = rte_get_tsc_cycles();
+      break;
+    case OSPF_TYPE_DD:
+      s->config.dd_sent++;
+      s->last_dd_sent = rte_get_tsc_cycles();
+      break;
+    case OSPF_TYPE_LSR:
+      s->config.lsr_sent++;
+      break;
+    case OSPF_TYPE_LSU:
+      s->config.lsu_sent++;
+      s->last_lsa_sent = rte_get_tsc_cycles();
+      break;
+    case OSPF_TYPE_LSACK:
+      s->config.lsack_sent++;
+      break;
+  }
+
+  return 0;
+}
+
+/* ---------- TX: Hello ---------- */
+
+int ospf_send_hello_packet(uint8_t pid, ospf_session_t *s, uint8_t iface_index)
+{
+  if (iface_index >= s->interface_count) return -1;
+
+  ospf_interface_t *iface = &s->interfaces[iface_index];
+  if (iface->is_passive) return 0;
+
+  uint32_t frr_router_id = string_to_ip("1.1.1.1");
+
+  /* Calculate actual neighbors on this interface */
+  uint16_t neighbor_count = 0;
+  for (int i = 0; i < s->neighbor_count; i++) {
+    if (s->neighbors[i].interface_index == iface_index &&
+        s->neighbors[i].state >= OSPF_STATE_INIT) {
+      neighbor_count++;
+    }
+  }
+
+  uint16_t hello_body_len = sizeof(struct ospf_hello) +
+    neighbor_count * sizeof(uint32_t);
+  uint8_t *buf = malloc(hello_body_len);
+  if (!buf) return -1;
+
+  struct ospf_hello *hello = (struct ospf_hello *)buf;
+  memset(hello, 0, hello_body_len);
+
+  hello->network_mask  = iface->network_mask;
+  hello->hello_interval = htons(OSPF_HELLO_INTERVAL);
+  hello->options        = OSPF_OPTION_E;
+  hello->priority       = iface->priority;  /* 0 for point-to-point */
+  hello->dead_interval  = htonl(OSPF_DEAD_INTERVAL);
+
+  /* For point-to-point interfaces, set DR/BDR to 0.0.0.0 */
+  hello->designated_router = 0;  /* 0.0.0.0 for point-to-point */
+  hello->backup_dr         = 0;  /* 0.0.0.0 for point-to-point */
+
+  uint32_t *nbr_ids = (uint32_t *)(hello + 1);
+  int idx = 0;
+
+  /* Add neighbors that are in INIT state or higher */
+  for (int i = 0; i < s->neighbor_count; i++) {
+    if (s->neighbors[i].interface_index == iface_index &&
+        s->neighbors[i].state >= OSPF_STATE_INIT) {
+      nbr_ids[idx++] = s->neighbors[i].router_id;
+    }
+  }
+
+  /* Debug: Calculate expected packet size */
+  uint16_t total_packet_size = sizeof(struct ethernet_hdr) +
+    sizeof(struct iphdr) +
+    sizeof(struct ospf_header) +
+    hello_body_len;
+
+  printf("[OSPF PID%u] Sending Hello on point-to-point interface %s: Router %s, Neighbors: %u, Packet size=%u bytes\n",
+      pid,
+      ip_to_string(iface->ip_address),
+      ip_to_string(s->router_id),
+      neighbor_count,
+      total_packet_size);
+
+  if (neighbor_count > 0) {
+    printf("[OSPF PID%u] Hello includes neighbor(s):", pid);
+    for (int i = 0; i < neighbor_count; i++) {
+      printf(" %s", ip_to_string(nbr_ids[i]));
+    }
+    printf("\n");
+  }
+
+  /* Send to FRR's IP address directly (unicast) */
+  uint32_t dst_ip;
+  if (pid == 0) {
+    dst_ip = string_to_ip("192.168.1.1");  /* FRR's IP on port 1 */
+  } else if (pid == 1) {
+    dst_ip = string_to_ip("192.168.2.1");  /* FRR's IP on port 2 */
+  } else {
+    dst_ip = string_to_ip("224.0.0.5");
+  }
+
+  int ret = ospf_send_packet(pid, s, OSPF_TYPE_HELLO,
+      buf, hello_body_len, dst_ip,
+      iface->ip_address);
+  free(buf);
+
+  iface->last_hello_sent = rte_get_tsc_cycles();
+
+  return ret;
+}
+
+/* ---------- TX: DD / LSR / LSU / LSAck ---------- */
+
+int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
+    uint32_t neighbor_rid, uint8_t flags, uint32_t dd_seq,
+    bool include_lsa_headers, uint8_t iface_index)
+{
+  if (iface_index >= s->interface_count) return -1;
+  ospf_interface_t *iface = &s->interfaces[iface_index];
+
+  uint16_t dd_body_len = sizeof(struct ospf_dd);
+  uint16_t lsa_header_len = 0;
+
+  /* FIX: Calculate the correct total length */
+  if (include_lsa_headers) {
+    /* Generate LSA to get its size */
+    uint8_t lsa_buf[OSPF_MAX_LSA_SIZE];
+    struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
+    if (ospf_generate_router_lsa(s, lsa, iface_index) != 0) {
+      printf("[OSPF PID%u] Failed to generate Router LSA\n", pid);
+      return -1;
+    }
+    lsa_header_len = ntohs(lsa->length);
+  }
+
+  uint16_t total_len = dd_body_len + lsa_header_len;
+  uint8_t *buf = malloc(total_len);
+  if (!buf) return -1;
+
+  struct ospf_dd *dd = (struct ospf_dd *)buf;
+  memset(dd, 0, total_len);
+
+  /* IMPORTANT: Set MTU to 0 for point-to-point links (RFC 2328) */
+  if (iface->type == OSPF_IFTYPE_P2P) {
+    dd->mtu = htons(0);  /* MTU=0 for P2P links */
+  } else {
+    dd->mtu = htons(OSPF_DEFAULT_MTU);
+  }
+
+  dd->options = s->config.options;
+
+  /* Set flags correctly */
+  dd->flags = flags;
+
+  /* For P2P links, we don't need MS flag negotiations */
+  if (iface->type == OSPF_IFTYPE_P2P) {
+    dd->flags &= ~OSPF_DD_FLAG_MS;  /* Clear MS flag for P2P */
+  } else {
+    /* As slave, NEVER set MS flag */
+    dd->flags &= ~OSPF_DD_FLAG_MS;
+  }
+
+  /* Never set I flag in responses */
+  dd->flags &= ~OSPF_DD_FLAG_I;
+
+  dd->dd_sequence = htonl(dd_seq);
+
+  /* Add LSA header if requested */
+  if (include_lsa_headers && lsa_header_len > 0) {
+    struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(dd + 1);
+    if (ospf_generate_router_lsa(s, lsa, iface_index) != 0) {
+      printf("[OSPF PID%u] Failed to generate Router LSA for DD\n", pid);
+      free(buf);
+      return -1;
+    }
+  }
+
+  /* Send directly to FRR */
+  uint32_t dst_ip;
+  if (pid == 0) {
+    dst_ip = string_to_ip("192.168.1.1");
+  } else if (pid == 1) {
+    dst_ip = string_to_ip("192.168.2.1");
+  } else {
+    dst_ip = string_to_ip("224.0.0.5");
+  }
+
+  printf("[OSPF PID%u] Sending DD to %s flags 0x%02x seq %u on %s interface %s\n",
+      pid, ip_to_string(neighbor_rid), dd->flags, dd_seq,
+      iface->type == OSPF_IFTYPE_P2P ? "P2P" : "BROADCAST",
+      ip_to_string(iface->ip_address));
+  printf("[OSPF PID%u] DD Send Flags: I=%u, M=%u, MS=%u, MTU=%u, Total len=%u\n",
+      pid,
+      (dd->flags & OSPF_DD_FLAG_I) ? 1 : 0,
+      (dd->flags & OSPF_DD_FLAG_M) ? 1 : 0,
+      (dd->flags & OSPF_DD_FLAG_MS) ? 1 : 0,
+      ntohs(dd->mtu),
+      total_len);
+
+  int ret = ospf_send_packet(pid, s, OSPF_TYPE_DD, buf, total_len, dst_ip, iface->ip_address);
+  free(buf);
+  return ret;
+}
+
+int ospf_send_lsr_packet(uint8_t pid, ospf_session_t *s,
+    uint32_t neighbor_rid, uint32_t ls_type,
+    uint32_t link_state_id, uint32_t adv_router, uint8_t iface_index)
+{
+  if (iface_index >= s->interface_count) return -1;
+  ospf_interface_t *iface = &s->interfaces[iface_index];
+
+  struct ospf_lsr lsr;
+  memset(&lsr, 0, sizeof(lsr));
+  lsr.ls_type           = htonl(ls_type);
+  lsr.link_state_id     = link_state_id;     /* already net order */
+  lsr.advertising_router = adv_router;      /* net order */
+
+  /* Send directly to FRR */
+  uint32_t dst_ip;
+  if (pid == 0) {
+    dst_ip = string_to_ip("192.168.1.1");
+  } else if (pid == 1) {
+    dst_ip = string_to_ip("192.168.2.1");
+  } else {
+    dst_ip = string_to_ip("224.0.0.5");
+  }
+
+  printf("[OSPF PID%u] Sending LSR to %s for LSA type %u on point-to-point interface %s\n",
+      pid, ip_to_string(neighbor_rid), ls_type,
+      ip_to_string(iface->ip_address));
+
+  return ospf_send_packet(pid, s, OSPF_TYPE_LSR, &lsr, sizeof(lsr), dst_ip, iface->ip_address);
+}
+
+int ospf_generate_router_lsa(ospf_session_t *s, struct ospf_lsa_header *lsa, uint8_t iface_index)
+{
+    static uint32_t seq_num = 0x80000001;
+
+    ospf_interface_t *iface = &s->interfaces[iface_index];
+
+    uint16_t num_links = 0;
+    for (int i = 0; i < s->neighbor_count; i++) {
+        if (s->neighbors[i].state >= OSPF_STATE_TWO_WAY) {
+            num_links++;
+        }
+    }
+    if (num_links == 0) num_links = 1;
+
+
+    uint16_t lsa_length = sizeof(struct ospf_lsa_header) + 4 + (num_links * sizeof(struct ospf_router_lsa_link));
+
+    struct ospf_lsa_header *hdr = (struct ospf_lsa_header *)lsa;
+    hdr->age = htons(0);
+    hdr->options = OSPF_OPTION_E;
+    hdr->type = LSA_TYPE_ROUTER;
+    hdr->link_state_id = s->router_id;
+    hdr->advertising_router = s->router_id;
+    hdr->sequence_number = htonl(seq_num++);
+    hdr->length = htons(lsa_length);
+
+    uint16_t *lsa_body = (uint16_t *)(hdr + 1);
+    lsa_body[0] = 0;
+    lsa_body[1] = htons(num_links);
+
+    struct ospf_router_lsa_link *link = (struct ospf_router_lsa_link *)(lsa_body + 2);
+    int current_link = 0;
+    for (int i = 0; i < s->neighbor_count; i++) {
+        if (s->neighbors[i].state >= OSPF_STATE_TWO_WAY) {
+            link[current_link].link_id = s->neighbors[i].router_id;
+            link[current_link].link_data = iface->ip_address;
+            link[current_link].type = 1; // P2P
+            link[current_link].num_tos = 0;
+            link[current_link].metric = htons(iface->cost);
+            current_link++;
+        }
+    }
+    if (current_link == 0) {
+        link[0].link_id = string_to_ip("1.1.1.1");
+        link[0].link_data = iface->ip_address;
+        link[0].type = 1; // P2P
+        link[0].num_tos = 0;
+        link[0].metric = htons(iface->cost);
+    }
+
+    hdr->checksum = ospf_lsa_checksum(hdr);
+
+    return 0;
+}
+
+int ospf_generate_network_lsa(ospf_session_t *s, struct ospf_lsa_header *lsa, uint8_t iface_index)
+{
+  static uint32_t seq_num = 0x80000001;
+
+  memset(lsa, 0, sizeof(*lsa));
+  lsa->age     = htons(1);
+  lsa->options = OSPF_OPTION_E;
+  lsa->type    = LSA_TYPE_NETWORK;
+  lsa->link_state_id      = s->interfaces[iface_index].ip_address;
+  lsa->advertising_router = s->router_id;
+  lsa->sequence_number    = htonl(seq_num++);
+  lsa->length             = htons(sizeof(struct ospf_lsa_header) + 4); /* + network mask */
+  lsa->checksum           = 0;
+  lsa->checksum           = htons(ospf_lsa_checksum(lsa));
+
+  return 0;
+}
+
+int ospf_send_lsu_packet(uint8_t pid, ospf_session_t *s,
+    uint32_t neighbor_rid, uint8_t lsa_type,
+    uint8_t lsa_count, struct ospf_lsa_header **lsas, uint8_t iface_index)
+{
+  if (iface_index >= s->interface_count) return -1;
+  ospf_interface_t *iface = &s->interfaces[iface_index];
+
+  /* Calculate total size */
+  uint16_t total_len = sizeof(struct ospf_lsu);
+  for (int i = 0; i < lsa_count; i++) {
+    if (lsas[i]) {
+      total_len += ntohs(lsas[i]->length);
+    }
+  }
+
+  uint8_t *buf = malloc(total_len);
+  if (!buf) return -1;
+
+  struct ospf_lsu *lsu = (struct ospf_lsu *)buf;
+  memset(lsu, 0, sizeof(*lsu));
+  lsu->num_lsas = htonl(lsa_count);
+
+  uint8_t *ptr = (uint8_t *)(lsu + 1);
+  for (int i = 0; i < lsa_count; i++) {
+    if (lsas[i]) {
+      uint16_t len = ntohs(lsas[i]->length);
+      memcpy(ptr, lsas[i], len);
+      ptr += len;
+    }
+  }
+
+  /* Send directly to FRR */
+  uint32_t dst_ip;
+  if (pid == 0) {
+    dst_ip = string_to_ip("192.168.1.1");
+  } else if (pid == 1) {
+    dst_ip = string_to_ip("192.168.2.1");
+  } else {
+    dst_ip = string_to_ip("224.0.0.5");
+  }
+
+  printf("[OSPF PID%u] Sending LSU with %u LSA(s) to %s on point-to-point interface %s\n",
+      pid, lsa_count, ip_to_string(neighbor_rid),
+      ip_to_string(iface->ip_address));
+
+  int ret = ospf_send_packet(pid, s, OSPF_TYPE_LSU, buf, total_len, dst_ip, iface->ip_address);
+  free(buf);
+  return ret;
+}
+
+int ospf_send_lsack_packet(uint8_t pid, ospf_session_t *s,
+    uint32_t neighbor_rid, struct ospf_lsa_header **lsas,
+    uint8_t lsa_count, uint8_t iface_index)
+{
+  if (iface_index >= s->interface_count) return -1;
+  ospf_interface_t *iface = &s->interfaces[iface_index];
+
+  printf("[OSPF PID%u] Sending LSAck to %s for %u LSAs on point-to-point interface %s\n",
+      pid, ip_to_string(neighbor_rid), lsa_count,
+      ip_to_string(iface->ip_address));
+
+  /* Send directly to FRR */
+  uint32_t dst_ip;
+  if (pid == 0) {
+    dst_ip = string_to_ip("192.168.1.1");
+  } else if (pid == 1) {
+    dst_ip = string_to_ip("192.168.2.1");
+  } else {
+    dst_ip = string_to_ip("224.0.0.5");
+  }
+
+  /* Send empty packet for now */
+  return ospf_send_packet(pid, s, OSPF_TYPE_LSACK, NULL, 0, dst_ip, iface->ip_address);
+}
+
+/* Helper to check if DD packet contains LSA headers */
+bool dd_contains_lsa_headers(struct ospf_header *hdr, struct ospf_dd *dd)
+{
+  uint16_t ospf_len = ntohs(hdr->length);
+  uint16_t header_len = sizeof(struct ospf_header) + sizeof(struct ospf_dd);
+
+  /* If OSPF length is greater than header + DD, it contains LSA headers */
+  return (ospf_len > header_len);
+}
+
+/* ---------- Neighbor state helper ---------- */
+
+void ospf_update_neighbor_state(ospf_session_t *s,
+    uint32_t neighbor_rid,
+    uint8_t interface_index,
+    ospf_state_t new_state)
+{
+  for (int i = 0; i < s->neighbor_count; i++) {
+    if (s->neighbors[i].router_id == neighbor_rid &&
+        s->neighbors[i].interface_index == interface_index) {
+      ospf_state_t old = s->neighbors[i].state;
+      if (old == new_state) return;
+      s->neighbors[i].state = new_state;
+
+      printf("[OSPF PID%u] Neighbor %s (interface %u) state: %s -> %s\n",
+          s->pid,
+          ip_to_string(neighbor_rid),
+          interface_index,
+          ospf_state_to_string(old),
+          ospf_state_to_string(new_state));
+
+      if (new_state == OSPF_STATE_FULL) {
+        s->config.neighbors_full++;
+        printf("[OSPF PID%u] *** Adjacency with %s established (FULL) ***\n",
+            s->pid, ip_to_string(neighbor_rid));
+      }
+      return;
+    }
+  }
+}
+
+/* ---------- Step-by-step exchange control ---------- */
+
+void ospf_start_exchange(ospf_session_t *s, uint8_t iface_index)
+{
+  ospf_interface_t *iface = &s->interfaces[iface_index];
+  iface->exchange_state.step = 0;
+  iface->exchange_state.waiting_for = 0;
+  iface->exchange_state.wait_until = 0;
+  iface->exchange_state.retry_count = 0;
+
+  printf("[OSPF PID%u] Exchange system ready on point-to-point interface %s\n",
+      s->pid, ip_to_string(iface->ip_address));
+}
+
+int ospf_process_exchange_steps(ospf_session_t *s, uint8_t pid)
+{
+  uint64_t now = rte_get_tsc_cycles();
+
+  for (int if_idx = 0; if_idx < s->interface_count; if_idx++) {
+    ospf_interface_t *iface = &s->interfaces[if_idx];
+
+    if (iface->exchange_state.step == 0) {
+      continue;
+    }
+
+    if (iface->exchange_state.wait_until > now) {
+      continue;
+    }
+
+    /* Process timeout */
+    switch (iface->exchange_state.step) {
+      case 6: /* Waiting to send LSR */
+        printf("[OSPF PID%u] Step 6: Sending LSR\n", pid);
+        ospf_send_lsr_packet(pid, s, string_to_ip("1.1.1.1"),
+            LSA_TYPE_ROUTER, s->router_id, s->router_id, if_idx);
+        iface->exchange_state.step = 7;
+        iface->exchange_state.wait_until = now + (2 * rte_get_tsc_hz());
+        break;
+
+      case 7: /* Waiting to send LSU */
+        printf("[OSPF PID%u] Step 7: Sending LSU\n", pid);
+        struct ospf_lsa_header lsa;
+        ospf_generate_router_lsa(s, &lsa, if_idx);
+        struct ospf_lsa_header *lsa_ptr = &lsa;
+        ospf_send_lsu_packet(pid, s, string_to_ip("1.1.1.1"),
+            LSA_TYPE_ROUTER, 1, &lsa_ptr, if_idx);
+        iface->exchange_state.step = 8;
+        iface->exchange_state.wait_until = now + (1 * rte_get_tsc_hz());
+        break;
+
+      case 8: /* Waiting to send LSAck */
+        printf("[OSPF PID%u] Step 8: Sending LSAck\n", pid);
+        ospf_send_lsack_packet(pid, s, string_to_ip("1.1.1.1"), NULL, 0, if_idx);
+        iface->exchange_state.step = 0;
+        break;
+
+      default:
+        iface->exchange_state.step = 0;
+        break;
+    }
+  }
+
+  return 0;
+}
+
+/* ---------- RX: Hello ---------- */
+
+int ospf_handle_hello_packet(struct ospf_header *hdr,
+    struct ospf_hello *hello,
+    uint8_t pid,
+    ospf_session_t *s,
+    uint32_t src_ip)
+{
+  uint32_t remote_rid  = hdr->router_id; /* net order */
+  uint32_t remote_area = hdr->area_id;   /* net order */
+
+  uint16_t hello_int = ntohs(hello->hello_interval);
+  uint32_t dead_int  = ntohl(hello->dead_interval);
+  uint32_t dr_ip     = hello->designated_router;
+  uint32_t bdr_ip    = hello->backup_dr;
+
+  /* Determine which interface received this Hello */
+  uint8_t iface_index = 0;
+  for (int i = 0; i < s->interface_count; i++) {
+    uint32_t network = s->interfaces[i].ip_address & s->interfaces[i].network_mask;
+    uint32_t src_network = src_ip & s->interfaces[i].network_mask;
+    if (network == src_network) {
+      iface_index = i;
+      break;
+    }
+  }
+
+  ospf_interface_t *iface = &s->interfaces[iface_index];
+
+  printf("[OSPF PID%u] <<< RECEIVED: Hello from Router %s (1.1.1.1) on point-to-point interface %u, packet size analysis:\n",
+      pid, ip_to_string(remote_rid), iface_index);
+
+  /* Calculate packet size for debugging */
+  uint16_t ospf_len = ntohs(hdr->length);
+  uint16_t total_packet_size = sizeof(struct ethernet_hdr) +
+    sizeof(struct iphdr) +
+    ospf_len;
+  printf("[OSPF PID%u] OSPF length: %u bytes, Total packet: ~%u bytes\n",
+      pid, ospf_len, total_packet_size);
+
+  if (remote_area != s->area_id) {
+    printf("[OSPF PID%u] Area mismatch: local %s, remote %s\n",
+        pid, ip_to_string(s->area_id), ip_to_string(remote_area));
+    return -1;
+  }
+
+  /* FRR uses 1.1.1.1 */
+  if (remote_rid != string_to_ip("1.1.1.1")) {
+    printf("[OSPF PID%u] ERROR: Expected neighbor RID 1.1.1.1, got %s\n",
+        pid, ip_to_string(remote_rid));
+    return -1;
+  }
+
+  /* Update interface DR/BDR info */
+  iface->designated_router = dr_ip;
+  iface->backup_dr = bdr_ip;
+
+  iface->last_hello_received = rte_get_tsc_cycles();
+
+  uint16_t total_len = ntohs(hdr->length);
+  uint16_t base = sizeof(struct ospf_header) + sizeof(struct ospf_hello);
+
+  bool found_ourselves = false;
+  int neighbor_count_in_hello = 0;
+
+  if (total_len > base) {
+    neighbor_count_in_hello = (total_len - base) / sizeof(uint32_t);
+    uint32_t *nbr_ids = (uint32_t *)(hello + 1);
+
+    printf("[OSPF PID%u] Hello contains %u neighbor(s): ", pid, neighbor_count_in_hello);
+    for (int i = 0; i < neighbor_count_in_hello; i++) {
+      uint32_t nid = nbr_ids[i]; /* net order */
+      printf("%s ", ip_to_string(nid));
+      if (nid == s->router_id) {
+        found_ourselves = true;
+      }
+    }
+    printf("\n");
+
+    if (found_ourselves) {
+      printf("[OSPF PID%u] *** Found ourselves in FRR's Hello (2-WAY) ***\n", pid);
+    }
+  } else {
+    printf("[OSPF PID%u] Hello contains 0 neighbors\n", pid);
+  }
+
+  /* Find or create neighbor entry */
+  int idx = -1;
+  for (int i = 0; i < s->neighbor_count; i++) {
+    if (s->neighbors[i].router_id == remote_rid &&
+        s->neighbors[i].interface_index == iface_index) {
+      idx = i; break;
+    }
+  }
+
+  if (idx == -1) {
+    if (s->neighbor_count >= OSPF_MAX_NEIGHBORS) {
+      printf("[OSPF PID%u] Neighbor table full\n", pid);
+      return -1;
+    }
+    idx = s->neighbor_count++;
+    ospf_neighbor_t *n = &s->neighbors[idx];
+    memset(n, 0, sizeof(*n));
+    n->router_id = remote_rid;
+    n->ip_address = src_ip;
+    n->interface_index = iface_index;
+    n->state = OSPF_STATE_DOWN;
+    n->priority = hello->priority;
+    n->dead_interval = dead_int;
+    n->dd_sequence = (rte_rand() & 0xffffff);
+    n->last_hello_received = rte_get_tsc_cycles();
+
+    /* Initialize exchange state */
+    n->exchange_state.retry_count = 0;
+    n->exchange_state.step = 0;
+    n->exchange_state.waiting_for = 0;
+    n->exchange_state.wait_until = 0;
+
+    printf("[OSPF PID%u] New OSPF neighbor discovered: FRR (1.1.1.1) on point-to-point interface %u\n",
+        pid, iface_index);
+
+    ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_INIT);
+  } else {
+    ospf_neighbor_t *n = &s->neighbors[idx];
+    n->last_hello_received = rte_get_tsc_cycles();
+  }
+
+  ospf_neighbor_t *nbr = &s->neighbors[idx];
+
+  if (found_ourselves) {
+    /* FRR listed us in its Hello */
+    if (nbr->state == OSPF_STATE_INIT) {
+      ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_TWO_WAY);
+
+      /* Send Hello response WITH FRR in neighbor list */
+      ospf_send_hello_packet(pid, s, iface_index);
+
+      /* Move to EXSTART immediately for point-to-point */
+      printf("[OSPF PID%u] Moving to EXSTART\n", pid);
+      ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXSTART);
+
+      /* FRR (1.1.1.1) is always master (higher RID) */
+      nbr->is_master = 0;  /* We are slave */
+      printf("[OSPF PID%u] We are SLAVE for FRR (RID %s < 1.1.1.1)\n",
+          pid, ip_to_string(s->router_id));
+
+      /* Don't send DD here - wait for FRR to send initial DD */
+      printf("[OSPF PID%u] Waiting for FRR to send initial DD\n", pid);
+    } else if (nbr->state >= OSPF_STATE_EXSTART && nbr->state <= OSPF_STATE_EXCHANGE) {
+      /* During DD exchange, FRR might temporarily not include us in Hello */
+      /* This is normal - just send Hello to maintain */
+      printf("[OSPF PID%u] In DD exchange (state=%s), FRR still includes us, maintaining state\n",
+          pid, ospf_state_to_string(nbr->state));
+      ospf_send_hello_packet(pid, s, iface_index);
+    } else {
+      /* Already in higher state, just maintain */
+      ospf_send_hello_packet(pid, s, iface_index);
+    }
+  } else {
+    /* FRR didn't list us in Hello */
+    if (nbr->state == OSPF_STATE_INIT) {
+      printf("[OSPF PID%u] FRR's Hello doesn't contain us yet (staying in INIT)\n", pid);
+      ospf_send_hello_packet(pid, s, iface_index);
+    } else if (nbr->state >= OSPF_STATE_EXSTART && nbr->state <= OSPF_STATE_EXCHANGE) {
+      /* CRITICAL FIX: During DD exchange, FRR might stop listing us temporarily */
+      /* This is NORMAL - don't drop state! */
+      printf("[OSPF PID%u] Note: FRR not listing us in Hello during DD exchange (state=%s)\n",
+          pid, ospf_state_to_string(nbr->state));
+      printf("[OSPF PID%u] This is normal OSPF behavior, maintaining state\n", pid);
+      ospf_send_hello_packet(pid, s, iface_index);
+    } else if (nbr->state >= OSPF_STATE_LOADING) {
+      /* In LOADING or FULL, FRR should list us */
+      printf("[OSPF PID%u] WARNING: FRR dropped us from Hello in state %s\n",
+          pid, ospf_state_to_string(nbr->state));
+      printf("[OSPF PID%u] Moving back to INIT\n", pid);
+      ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_INIT);
+      ospf_send_hello_packet(pid, s, iface_index);
+    }
+  }
+
+  return 0;
+}
+
+/* ---------- RX: DD ---------- */
+
+int ospf_handle_dd_packet(struct ospf_header *hdr,
+    struct ospf_dd *dd,
+    uint8_t pid,
+    ospf_session_t *s,
+    uint32_t src_ip)
+{
+  uint32_t remote_rid = hdr->router_id;  /* Should be 1.1.1.1 */
+  uint32_t dd_seq = ntohl(dd->dd_sequence);
+  uint8_t flags = dd->flags;
+
+  /* Determine interface */
+  uint8_t iface_index = 0;
+  for (int i = 0; i < s->interface_count; i++) {
+    uint32_t network = s->interfaces[i].ip_address & s->interfaces[i].network_mask;
+    uint32_t src_network = src_ip & s->interfaces[i].network_mask;
+    if (network == src_network) {
+      iface_index = i;
+      break;
+    }
+  }
+
+  printf("[OSPF PID%u] <<< RECEIVED: DD from FRR (1.1.1.1) seq %u flags 0x%02x on interface %u\n",
+      pid, dd_seq, flags, iface_index);
+  printf("[OSPF PID%u] DD Flags: I=%u, M=%u, MS=%u\n",
+      pid,
+      (flags & OSPF_DD_FLAG_I) ? 1 : 0,
+      (flags & OSPF_DD_FLAG_M) ? 1 : 0,
+      (flags & OSPF_DD_FLAG_MS) ? 1 : 0);
+
+  /* Check if DD contains LSA headers */
+  bool has_lsa_headers = dd_contains_lsa_headers(hdr, dd);
+  printf("[OSPF PID%u] DD contains LSA headers: %s\n", pid, has_lsa_headers ? "YES" : "NO");
+
+  ospf_neighbor_t *nbr = NULL;
+  for (int i = 0; i < s->neighbor_count; i++) {
+    if (s->neighbors[i].router_id == remote_rid &&
+        s->neighbors[i].interface_index == iface_index) {
+      nbr = &s->neighbors[i];
+      break;
+    }
+  }
+  if (!nbr) {
+    printf("[OSPF PID%u] DD from unknown FRR neighbor\n", pid);
+    return -1;
+  }
+
+  nbr->last_dd_received = rte_get_tsc_cycles();
+
+  /* For point-to-point links, the exchange is simplified */
+  switch (nbr->state) {
+    case OSPF_STATE_EXSTART:
+      if (flags & OSPF_DD_FLAG_I) {
+        /* Initial DD from FRR (master) - store sequence number */
+        printf("[OSPF PID%u] Initial DD from FRR (master), storing seq %u\n", pid, dd_seq);
+        nbr->dd_sequence = dd_seq;
+
+        /* For P2P: Send empty DD to acknowledge and move to EXCHANGE */
+        printf("[OSPF PID%u] Sending empty DD acknowledgment\n", pid);
+        ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
+
+        /* Move to EXCHANGE state */
+        ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
+
+        /* CRITICAL FIX: For P2P, send our DD with LSA headers immediately */
+        printf("[OSPF PID%u] For P2P: Sending our DD with LSA headers immediately\n", pid);
+        ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
+
+        /* Set exchange state */
+        nbr->exchange_state.step = 1;
+        nbr->exchange_state.waiting_for = OSPF_TYPE_DD;
+        nbr->exchange_state.wait_until = rte_get_tsc_cycles() + (10 * rte_get_tsc_hz());
+      }
+      break;
+
+    case OSPF_STATE_EXCHANGE:
+      if (flags & OSPF_DD_FLAG_I) {
+        /* FRR is retransmitting initial DD - this means it didn't see our response */
+        printf("[OSPF PID%u] FRR retransmitted initial DD, seq %u\n", pid, dd_seq);
+
+        /* Check if this is a new sequence number */
+        if (dd_seq != nbr->dd_sequence) {
+          printf("[OSPF PID%u] New DD sequence %u (was %u), restarting\n",
+                 pid, dd_seq, nbr->dd_sequence);
+          nbr->dd_sequence = dd_seq;
+          ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
+          ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
+        } else {
+          /* Same sequence - FRR missed our response, resend */
+          printf("[OSPF PID%u] Resending our DD with LSA headers\n", pid);
+          ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
+        }
+      } else {
+        /* Regular DD without I flag */
+        printf("[OSPF PID%u] FRR sent regular DD, seq %u, flags 0x%02x\n",
+               pid, dd_seq, flags);
+
+        if (has_lsa_headers) {
+          /* FRR sent DD with LSA headers - process them */
+          printf("[OSPF PID%u] FRR's DD contains LSA headers\n", pid);
+
+          /* If M flag is clear, this is the final DD */
+          if ((flags & OSPF_DD_FLAG_M) == 0) {
+            printf("[OSPF PID%u] FRR's final DD, moving to LOADING\n", pid);
+            ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
+
+            /* Schedule LSR */
+            ospf_interface_t *iface = &s->interfaces[iface_index];
+            iface->exchange_state.step = 6;
+            iface->exchange_state.wait_until = rte_get_tsc_cycles() + (1 * rte_get_tsc_hz());
+          }
+        } else {
+          /* FRR sent empty DD without I flag - acknowledge */
+          printf("[OSPF PID%u] FRR sent empty DD, acknowledging\n", pid);
+          ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
+
+          /* If M flag is clear and we haven't sent LSA headers, send them */
+          if ((flags & OSPF_DD_FLAG_M) == 0 && nbr->exchange_state.step == 0) {
+            printf("[OSPF PID%u] Sending our DD with LSA headers\n", pid);
+            ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
+            nbr->exchange_state.step = 1;
+          }
+        }
+      }
+      break;
+
+    case OSPF_STATE_LOADING:
+    case OSPF_STATE_FULL:
+      /* In LOADING or FULL state, just acknowledge any DD packets */
+      printf("[OSPF PID%u] In %s state, acknowledging DD\n",
+             pid, ospf_state_to_string(nbr->state));
+      ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
+      break;
+
+    default:
+      printf("[OSPF PID%u] Received DD in unexpected state %s\n",
+             pid, ospf_state_to_string(nbr->state));
+      break;
+  }
+
+  return 0;
+}
+
+/* ---------- RX: LSR / LSU / LSAck ---------- */
+
+int ospf_handle_lsr_packet(struct ospf_header *hdr,
+    struct ospf_lsr *lsr,
+    uint8_t pid,
+    ospf_session_t *s,
+    uint32_t src_ip)
+{
+  uint32_t remote_rid = hdr->router_id;  /* Should be 1.1.1.1 */
+  uint32_t ls_type = ntohl(lsr->ls_type);
+
+  /* Determine interface */
+  uint8_t iface_index = 0;
+  for (int i = 0; i < s->interface_count; i++) {
+    uint32_t network = s->interfaces[i].ip_address & s->interfaces[i].network_mask;
+    uint32_t src_network = src_ip & s->interfaces[i].network_mask;
+    if (network == src_network) {
+      iface_index = i;
+      break;
+    }
+  }
+
+  printf("[OSPF PID%u] <<< RECEIVED: LSR from FRR (1.1.1.1) type %u on interface %u\n",
+      pid, ls_type, iface_index);
+
+  /* Send LSU response immediately */
+  printf("[OSPF PID%u] Sending LSU response immediately\n", pid);
+  struct ospf_lsa_header lsa;
+  ospf_generate_router_lsa(s, &lsa, iface_index);
+  struct ospf_lsa_header *lsa_ptr = &lsa;
+  ospf_send_lsu_packet(pid, s, remote_rid, LSA_TYPE_ROUTER, 1, &lsa_ptr, iface_index);
+
+  return 0;
+}
+
+int ospf_handle_lsu_packet(struct ospf_header *hdr,
+    struct ospf_lsu *lsu,
+    uint8_t pid,
+    ospf_session_t *s,
+    uint32_t src_ip)
+{
+  uint32_t remote_rid = hdr->router_id;  /* Should be 1.1.1.1 */
+  uint32_t num = ntohl(lsu->num_lsas);
+
+  /* Determine interface */
+  uint8_t iface_index = 0;
+  for (int i = 0; i < s->interface_count; i++) {
+    uint32_t network = s->interfaces[i].ip_address & s->interfaces[i].network_mask;
+    uint32_t src_network = src_ip & s->interfaces[i].network_mask;
+    if (network == src_network) {
+      iface_index = i;
+      break;
+    }
+  }
+
+  printf("[OSPF PID%u] <<< RECEIVED: LSU from FRR (1.1.1.1) with %u LSA(s) on interface %u\n",
+      pid, num, iface_index);
+
+  struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(lsu + 1);
+
+  for (uint32_t i = 0; i < num && i < OSPF_MAX_LSAS_PER_UPDATE; i++) {
+    uint64_t key = ((uint64_t)lsa->type << 32) | lsa->link_state_id;
+
+    /* Add to LSDB */
+    void *existing_data;
+    if (rte_hash_lookup_data(s->lsdb, &key, &existing_data) < 0) {
+      rte_hash_add_key_data(s->lsdb, &key, lsa);
+      printf("[OSPF PID%u] LSDB add: type %u, LSID %s, Adv %s\n",
+          pid, lsa->type,
+          ip_to_string(lsa->link_state_id),
+          ip_to_string(lsa->advertising_router));
+    }
+
+    /* Move to next LSA */
+    lsa = (struct ospf_lsa_header *)((uint8_t *)lsa + ntohs(lsa->length));
+  }
+
+  /* Send LSAck immediately */
+  printf("[OSPF PID%u] Sending LSAck immediately\n", pid);
+  ospf_send_lsack_packet(pid, s, remote_rid, NULL, 0, iface_index);
+
+  /* Move to FULL state */
+  for (int i = 0; i < s->neighbor_count; i++) {
+    if (s->neighbors[i].router_id == remote_rid &&
+        s->neighbors[i].interface_index == iface_index &&
+        s->neighbors[i].state == OSPF_STATE_LOADING) {
+      printf("[OSPF PID%u] Moving to FULL state with FRR\n", pid);
+      ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_FULL);
+      break;
+    }
+  }
+
+  return 0;
+}
+
+int ospf_handle_lsack_packet(struct ospf_header *hdr,
+    uint8_t pid,
+    ospf_session_t *s,
+    uint32_t src_ip)
+{
+  uint32_t remote_rid = hdr->router_id;  /* Should be 1.1.1.1 */
+
+  /* Determine interface */
+  uint8_t iface_index = 0;
+  for (int i = 0; i < s->interface_count; i++) {
+    uint32_t network = s->interfaces[i].ip_address & s->interfaces[i].network_mask;
+    uint32_t src_network = src_ip & s->interfaces[i].network_mask;
+    if (network == src_network) {
+      iface_index = i;
+      break;
+    }
+  }
+
+  printf("[OSPF PID%u] <<< RECEIVED: LSAck from FRR (1.1.1.1) on interface %u\n",
+      pid, iface_index);
+
+  printf("[OSPF PID%u] Exchange complete with FRR on interface %u\n",
+      pid, iface_index);
+
+  return 0;
+}
+
+/* ---------- Neighbor timeouts / retransmit ---------- */
+
+#define OSPF_DD_RETRANSMIT_INTERVAL 5 /* seconds */
+
+void ospf_process_neighbor_timeouts(ospf_session_t *s, uint8_t pid)
+{
+  uint64_t now = rte_get_tsc_cycles();
+  uint64_t dead_cycles = (uint64_t)s->config.dead_interval * rte_get_tsc_hz();
+
+  for (int i = 0; i < s->neighbor_count; i++) {
+    ospf_neighbor_t *n = &s->neighbors[i];
+
+    /* Dead timer check */
+    if (n->state != OSPF_STATE_DOWN && now - n->last_hello_received > dead_cycles) {
+      printf("[OSPF PID%u] Neighbor %s dead timer expired on interface %u\n",
+          pid, ip_to_string(n->router_id), n->interface_index);
+      ospf_update_neighbor_state(s, n->router_id, n->interface_index, OSPF_STATE_DOWN);
+
+      for (int j = i; j < s->neighbor_count - 1; j++)
+        s->neighbors[j] = s->neighbors[j+1];
+      s->neighbor_count--;
+      i--;
+      continue;
+    }
+
+    /* State-specific timeout handling */
+    switch (n->state) {
+      case OSPF_STATE_EXSTART:
+        /* EXSTART timeout - FRR should send initial DD within 30 seconds */
+        {
+          uint64_t exstart_timeout = 30 * rte_get_tsc_hz();
+          if (n->last_dd_received != 0 && now - n->last_dd_received > exstart_timeout) {
+            printf("[OSPF PID%u] EXSTART timeout with FRR on interface %u\n",
+                pid, n->interface_index);
+            /* Send Hello to restart the process */
+            ospf_send_hello_packet(pid, s, n->interface_index);
+            n->last_dd_received = now; /* Reset timer */
+          }
+        }
+        break;
+
+      case OSPF_STATE_EXCHANGE:
+        /* EXCHANGE timeout - check if waiting for FRR's DD with LSA headers */
+        if (n->exchange_state.waiting_for == OSPF_TYPE_DD &&
+            now > n->exchange_state.wait_until) {
+          printf("[OSPF PID%u] EXCHANGE timeout waiting for FRR's DD with LSA headers\n", pid);
+
+          n->exchange_state.retry_count++;
+          if (n->exchange_state.retry_count >= 3) {
+            printf("[OSPF PID%u] Too many retries, restarting adjacency\n", pid);
+            ospf_update_neighbor_state(s, n->router_id, n->interface_index, OSPF_STATE_EXSTART);
+            n->exchange_state.retry_count = 0;
+            n->exchange_state.waiting_for = 0;
+            n->exchange_state.step = 0;
+          } else {
+            /* Resend our DD with LSA headers */
+            printf("[OSPF PID%u] Retry %u: Resending DD with LSA headers\n",
+                pid, n->exchange_state.retry_count);
+            ospf_send_dd_packet(pid, s, n->router_id,
+                OSPF_DD_FLAG_M, n->dd_sequence, true, n->interface_index);
+            n->exchange_state.wait_until = now + (10 * rte_get_tsc_hz());
+          }
+        }
+        break;
+
+      case OSPF_STATE_LOADING:
+        /* LOADING timeout - check for LSR/LSU exchange */
+        if (n->exchange_state.waiting_for == OSPF_TYPE_LSU &&
+            now > n->exchange_state.wait_until) {
+          printf("[OSPF PID%u] LOADING timeout waiting for LSU\n", pid);
+
+          /* Resend LSR */
+          printf("[OSPF PID%u] Resending LSR\n", pid);
+          ospf_send_lsr_packet(pid, s, n->router_id,
+              LSA_TYPE_ROUTER, n->router_id, n->router_id, n->interface_index);
+          n->exchange_state.wait_until = now + (5 * rte_get_tsc_hz());
+        }
+        break;
+
+      default:
+        /* Other states don't need special timeout handling */
+        break;
+    }
+  }
+}
+
+/* ---------- Main test loop ---------- */
+
+int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
+{
+  (void)userId;
+  (void)pairPid;
+
+  uint8_t lid = rte_lcore_id();
+  uint16_t nb_rx;
+  struct rte_mbuf *pkts[32];
+
+  uint32_t router_id;
+  uint32_t area_id = string_to_ip("0.0.0.0");
+  uint64_t hello_cycles;
+  uint64_t last_periodic_hello = 0;
+
+  printf("\n=== Starting OSPF Test on PID %u, Core %u ===\n", pid, lid);
+
+  /* Set Router IDs based on your topology */
+  switch (pid) {
+    case 0:
+      router_id = string_to_ip("2.2.2.2");  /* Your router RID for PID 0 */
+      break;
+    case 1:
+      router_id = string_to_ip("3.3.3.3");  /* Your router RID for PID 1 */
+      break;
+    default:
+      router_id = string_to_ip("192.168.99.99");
+      break;
+  }
+
+  if (ospf_initialize_test(pid, router_id, area_id) != 0) {
+    printf("Failed to initialize OSPF test on PID %u\n", pid);
+    return -1;
+  }
+
+  ospf_session_t *s = &ospf_sessions[pid];
+
+  uint8_t mac[6];
+  switch (pid) {
+    case 0: memcpy(mac, (uint8_t[]){0x00,0x11,0x22,0x33,0x44,0x01}, 6); break;
+    case 1: memcpy(mac, (uint8_t[]){0x00,0x11,0x22,0x33,0x44,0x02}, 6); break;
+    default: memcpy(mac, (uint8_t[]){0x00,0x11,0x22,0x33,0x44,0x99}, 6); break;
+  }
+
+  printf("OSPF Configuration (PID %u):\n", pid);
+  printf("  Router ID: %s\n", ip_to_string(s->router_id));
+  printf("  Area: %s\n", ip_to_string(s->area_id));
+  printf("  Interface: %s/%s (Point-to-Point)\n",
+      ip_to_string(s->interfaces[0].ip_address),
+      ip_to_string(s->config.network_mask));
+  printf("  Interface Type: %s\n", s->interfaces[0].type == OSPF_IFTYPE_P2P ? "POINT-TO-POINT" : "BROADCAST");
+  printf("  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+      mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+
+  hello_cycles = (uint64_t)s->config.hello_interval * rte_get_tsc_hz();
+
+  /* CRITICAL FIX: Send initial Hello immediately upon startup */
+  printf("[OSPF PID%u] Sending INITIAL Hello to discover FRR\n", pid);
+  ospf_send_hello_packet(pid, s, 0);
+  last_periodic_hello = rte_get_tsc_cycles();
+
+  /* Start step-by-step exchange */
+  ospf_start_exchange(s, 0);
+
+  while (pblast[pid].trafficStatus) {
+    uint64_t now = rte_get_tsc_cycles();
+
+    /* Process step-by-step exchange */
+    ospf_process_exchange_steps(s, pid);
+
+    /* Send periodic Hellos every hello_interval */
+    if (now - last_periodic_hello > hello_cycles) {
+      printf("[OSPF PID%u] Sending periodic Hello\n", pid);
+      ospf_send_hello_packet(pid, s, 0);
+      last_periodic_hello = now;
+    }
+
+    /* Process neighbor timeouts */
+    ospf_process_neighbor_timeouts(s, pid);
+
+    /* Receive and process packets */
+    nb_rx = rte_eth_rx_burst(pid, 0, pkts, 32);
+    for (uint16_t i = 0; i < nb_rx; i++) {
+      struct ethernet_hdr *eth = rte_pktmbuf_mtod(pkts[i], struct ethernet_hdr *);
+      struct iphdr *ip = (struct iphdr *)(eth + 1);
+
+      /* Only process OSPF packets */
+      if (eth->ether_type == htons(ETHERTYPE_IP) &&
+          ip->protocol == OSPF_PROTOCOL_NUMBER) {
+        ospf_process_packet(pkts[i], pid, s);
+      }
+      rte_pktmbuf_free(pkts[i]);
+    }
+
+    /* Run SPF when we have FULL neighbors */
+    if (s->config.neighbors_full > 0) {
+      static uint64_t last_spf_run = 0;
+      if (now - last_spf_run > (5 * rte_get_tsc_hz())) {
+        printf("[OSPF PID%u] Running SPF calculation\n", pid);
+        last_spf_run = now;
+      }
+    }
+
+    /* CRITICAL: Reduce delay to respond faster to FRR */
+    rte_delay_us(50000); /* 50ms delay (was 100ms) */
+  }
+
+  printf("\n=== OSPF Test Stopped on PID %u ===\n", pid);
+  return 0;
+}
+
+/* ---------- RX: top-level dispatcher ---------- */
+
+int ospf_process_packet(struct rte_mbuf *pkt, uint8_t pid, ospf_session_t *s)
+{
+  struct ethernet_hdr *eth = rte_pktmbuf_mtod(pkt, struct ethernet_hdr *);
+
+  if (pblast[pid].trafficCapture) {
+    pblast_pcapdump(pid, (const u_char *)eth, pkt->data_len);
+  }
+
+  if (eth->ether_type != htons(ETHERTYPE_IP))
+    return -1;
+
+  struct iphdr *ip = (struct iphdr *)(eth + 1);
+  if (ip->protocol != OSPF_PROTOCOL_NUMBER)
+    return -1;
+
+  struct ospf_header *hdr = (struct ospf_header *)(ip + 1);
+
+  if (hdr->version != OSPF_VERSION) {
+    printf("[OSPF PID%u] Invalid OSPF version %u\n", pid, hdr->version);
+    return -1;
+  }
+
+  uint16_t ospf_len = ntohs(hdr->length);
+  uint16_t rec = ntohs(hdr->checksum);
+  uint16_t calc = ospf_checksum(hdr, ospf_len);
+
+  if (rec != calc) {
+    printf("[OSPF PID%u] OSPF checksum error: received %04x, calculated %04x\n",
+        pid, rec, calc);
+  }
+
+  switch (hdr->type) {
+    case OSPF_TYPE_HELLO:
+      s->config.hello_received++;
+      return ospf_handle_hello_packet(
+          hdr, (struct ospf_hello *)(hdr + 1), pid, s, ip->saddr);
+    case OSPF_TYPE_DD:
+      s->config.dd_received++;
+      return ospf_handle_dd_packet(
+          hdr, (struct ospf_dd *)(hdr + 1), pid, s, ip->saddr);
+    case OSPF_TYPE_LSR:
+      s->config.lsr_received++;
+      return ospf_handle_lsr_packet(
+          hdr, (struct ospf_lsr *)(hdr + 1), pid, s, ip->saddr);
+    case OSPF_TYPE_LSU:
+      s->config.lsu_received++;
+      return ospf_handle_lsu_packet(
+          hdr, (struct ospf_lsu *)(hdr + 1), pid, s, ip->saddr);
+    case OSPF_TYPE_LSACK:
+      s->config.lsack_received++;
+      return ospf_handle_lsack_packet(hdr, pid, s, ip->saddr);
+    default:
+      printf("[OSPF PID%u] Unknown OSPF type %u\n",
+          pid, hdr->type);
+      return -1;
+  }
+}
