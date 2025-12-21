@@ -1309,6 +1309,8 @@ void ospf_process_neighbor_timeouts(ospf_session_t *s, uint8_t pid)
           pid, ip_to_string(n->router_id), n->interface_index);
       ospf_update_neighbor_state(s, n->router_id, n->interface_index, OSPF_STATE_DOWN);
 
+      s->dirty_lsa = 1;
+
       for (int j = i; j < s->neighbor_count - 1; j++)
         s->neighbors[j] = s->neighbors[j+1];
       s->neighbor_count--;
@@ -1458,6 +1460,42 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
     /* Process neighbor timeouts */
     ospf_process_neighbor_timeouts(s, pid);
 
+    if (s->sim_routes_count > 0) {
+        for (uint32_t i = 0; i < s->sim_routes_count; i++) {
+            uint8_t lsa_buf[OSPF_MAX_LSA_SIZE] = {0};
+            struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
+            uint32_t sim_route = s->sim_routes_start + i;
+
+            if (ospf_generate_external_lsa(s, lsa, sim_route) == 0) {
+                for (int j = 0; j < s->neighbor_count; j++) {
+                    ospf_neighbor_t *n = &s->neighbors[j];
+
+                    if (n->state >= OSPF_STATE_EXCHANGE) {
+                        struct ospf_lsa_header *lsa_list[] = {lsa};
+                        ospf_send_lsu_packet(pid, s, n->router_id, lsa->type, 1, lsa_list, n->interface_index);
+                    }
+                }
+            }
+        }
+    }
+
+    if(s->dirty_lsa) {
+        uint8_t lsa_buf[OSPF_MAX_LSA_SIZE] = {0};
+        struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
+
+        if (ospf_generate_router_lsa(s, lsa, 0) == 0) {
+            for (int i = 0; i < s->neighbor_count; i++) {
+                ospf_neighbor_t *n = &s->neighbors[i];
+
+                if (n->state >= OSPF_STATE_EXCHANGE) {
+                    struct ospf_lsa_header *lsa_list[] = {lsa};
+                    ospf_send_lsu_packet(pid, s, n->router_id, lsa->type, 1, lsa_list, n->interface_index);
+                }
+            }
+        }
+        s->dirty_lsa = 0;
+    }
+
     /* Receive and process packets */
     nb_rx = rte_eth_rx_burst(pid, 0, pkts, 32);
     for (uint16_t i = 0; i < nb_rx; i++) {
@@ -1547,4 +1585,41 @@ int ospf_process_packet(struct rte_mbuf *pkt, uint8_t pid, ospf_session_t *s)
           pid, hdr->type);
       return -1;
   }
+}
+
+int ospf_add_simulated_routes(ospf_session_t *s, uint32_t count, uint32_t start_ip) {
+    if (!s) return -1;
+
+    s->sim_routes_count = count;
+    s->sim_routes_start = start_ip;
+
+    printf("[OSPF PID%u] Simulating %u routes starting from %s\n",
+           s->pid, count, ip_to_string(start_ip));
+
+    return 0;
+}
+
+int ospf_generate_external_lsa(ospf_session_t *s, struct ospf_lsa_header *lsa, uint32_t link_state_id) {
+    static uint32_t seq_num = 0x80000001;
+
+    uint16_t lsa_length = sizeof(struct ospf_lsa_header) + sizeof(struct ospf_external_lsa);
+
+    struct ospf_lsa_header *hdr = (struct ospf_lsa_header *)lsa;
+    hdr->age = htons(0);
+    hdr->options = OSPF_OPTION_E;
+    hdr->type = LSA_TYPE_EXTERNAL;
+    hdr->link_state_id = link_state_id;
+    hdr->advertising_router = s->router_id;
+    hdr->sequence_number = htonl(seq_num++);
+    hdr->length = htons(lsa_length);
+
+    struct ospf_external_lsa *ext_lsa = (struct ospf_external_lsa *)(hdr + 1);
+    ext_lsa->network_mask = htonl(0xFFFFFFFF);
+    ext_lsa->metric = htonl(10);
+    ext_lsa->forwarding_address = 0;
+    ext_lsa->external_route_tag = 0;
+
+    hdr->checksum = ospf_lsa_checksum(hdr);
+
+    return 0;
 }

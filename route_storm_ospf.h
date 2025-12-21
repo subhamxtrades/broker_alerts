@@ -134,6 +134,14 @@ struct ospf_router_lsa_link {
     uint16_t metric;
 } __attribute__((packed));
 
+/* External LSA (RFC 2328, A.4.5) */
+struct ospf_external_lsa {
+    uint32_t network_mask;
+    uint32_t metric;
+    uint32_t forwarding_address;
+    uint32_t external_route_tag;
+} __attribute__((packed));
+
 /* Message exchange tracking */
 typedef struct {
     uint8_t step;           /* Current step in message exchange */
@@ -233,6 +241,11 @@ typedef struct {
     uint8_t dr_election_done;
     uint32_t network_lsa_id;    /* For network LSA generation */
     uint8_t exchange_in_progress; /* Flag to control step-by-step exchange */
+    uint8_t dirty_lsa;
+
+    uint32_t sim_routes_count;
+    uint32_t sim_routes_start;
+    uint64_t spf_run_count;
 } ospf_session_t;
 
 /* Helper / API */
@@ -284,6 +297,8 @@ void ospf_interface_dr_election(ospf_session_t *session, uint8_t iface_index);
 /* LSAs / SPF */
 int ospf_generate_router_lsa(ospf_session_t *session, struct ospf_lsa_header *lsa, uint8_t iface_index);
 int ospf_generate_network_lsa(ospf_session_t *session, struct ospf_lsa_header *lsa, uint8_t iface_index);
+int ospf_generate_external_lsa(ospf_session_t *s, struct ospf_lsa_header *lsa, uint32_t link_state_id);
+int ospf_add_simulated_routes(ospf_session_t *s, uint32_t count, uint32_t start_ip);
 void ospf_run_spf(ospf_session_t *session);
 int ospf_add_route(ospf_session_t *session, uint32_t prefix, uint32_t mask,
                    uint32_t next_hop, uint16_t metric, uint8_t lsa_type);
