@@ -984,13 +984,23 @@ int ospf_handle_hello_packet(struct ospf_header *hdr,
       printf("[OSPF PID%u] Moving to EXSTART\n", pid);
       ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXSTART);
 
-      /* FRR (1.1.1.1) is always master (higher RID) */
-      nbr->is_master = 0;  /* We are slave */
-      printf("[OSPF PID%u] We are SLAVE for FRR (RID %s < 1.1.1.1)\n",
-          pid, ip_to_string(s->router_id));
+      if (ntohl(s->router_id) > ntohl(remote_rid)) {
+        nbr->is_master = 1;
+        printf("[OSPF PID%u] We are MASTER for FRR (RID %s > %s)\n",
+               pid, ip_to_string(s->router_id), ip_to_string(remote_rid));
+      } else {
+        nbr->is_master = 0;  /* We are slave */
+        printf("[OSPF PID%u] We are SLAVE for FRR (RID %s < %s)\n",
+            pid, ip_to_string(s->router_id), ip_to_string(remote_rid));
+      }
 
-      /* Don't send DD here - wait for FRR to send initial DD */
-      printf("[OSPF PID%u] Waiting for FRR to send initial DD\n", pid);
+      if (nbr->is_master) {
+        printf("[OSPF PID%u] Sending initial DD as master\n", pid);
+        ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, false, iface_index);
+      } else {
+        /* Don't send DD here - wait for FRR to send initial DD */
+        printf("[OSPF PID%u] Waiting for FRR to send initial DD\n", pid);
+      }
     } else if (nbr->state >= OSPF_STATE_EXSTART && nbr->state <= OSPF_STATE_EXCHANGE) {
       /* During DD exchange, FRR might temporarily not include us in Hello */
       /* This is normal - just send Hello to maintain */
@@ -1079,26 +1089,30 @@ int ospf_handle_dd_packet(struct ospf_header *hdr,
   /* For point-to-point links, the exchange is simplified */
   switch (nbr->state) {
     case OSPF_STATE_EXSTART:
-      if (flags & OSPF_DD_FLAG_I) {
-        /* Initial DD from FRR (master) - store sequence number */
-        printf("[OSPF PID%u] Initial DD from FRR (master), storing seq %u\n", pid, dd_seq);
-        nbr->dd_sequence = dd_seq;
+      if (nbr->is_master) {
+        if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) && (dd_seq == nbr->dd_sequence)) {
+            printf("[OSPF PID%u] Received DD from slave, moving to EXCHANGE\n", pid);
+            ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
+            ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, ++nbr->dd_sequence, true, iface_index);
+        }
+      } else {
+          if (flags & OSPF_DD_FLAG_I) {
+            /* Initial DD from FRR (master) - store sequence number */
+            printf("[OSPF PID%u] Initial DD from FRR (master), storing seq %u\n", pid, dd_seq);
+            nbr->dd_sequence = dd_seq;
 
-        /* For P2P: Send empty DD to acknowledge and move to EXCHANGE */
-        printf("[OSPF PID%u] Sending empty DD acknowledgment\n", pid);
-        ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
+            /* Move to EXCHANGE state */
+            ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
 
-        /* Move to EXCHANGE state */
-        ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
+            /* CRITICAL FIX: For P2P, send our DD with LSA headers immediately */
+            printf("[OSPF PID%u] For P2P: Sending our DD with LSA headers immediately\n", pid);
+            ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
 
-        /* CRITICAL FIX: For P2P, send our DD with LSA headers immediately */
-        printf("[OSPF PID%u] For P2P: Sending our DD with LSA headers immediately\n", pid);
-        ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
-
-        /* Set exchange state */
-        nbr->exchange_state.step = 1;
-        nbr->exchange_state.waiting_for = OSPF_TYPE_DD;
-        nbr->exchange_state.wait_until = rte_get_tsc_cycles() + (10 * rte_get_tsc_hz());
+            /* Set exchange state */
+            nbr->exchange_state.step = 1;
+            nbr->exchange_state.waiting_for = OSPF_TYPE_DD;
+            nbr->exchange_state.wait_until = rte_get_tsc_cycles() + (10 * rte_get_tsc_hz());
+          }
       }
       break;
 
