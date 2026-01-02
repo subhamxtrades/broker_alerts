@@ -86,16 +86,15 @@ The simulator follows the standard OSPFv2 state machine to establish an adjacenc
 
 3.  **2-Way State**: When the simulator receives a Hello packet from a neighbor that contains the simulator's own Router ID in the "Neighbors" list, it confirms that communication is bidirectional. The state transitions to `2-WAY`.
 
-4.  **ExStart State**: For Point-to-Point links, the state machine immediately proceeds from `2-WAY` to `EXSTART`. In this state, the two routers negotiate the master/slave relationship for the upcoming LSDB synchronization.
-    *   **Master/Slave Election**: The router with the **higher Router ID** becomes the **master**. The master is responsible for setting the initial sequence number for the Database Description (DD) packet exchange.
-    *   The `ospf_handle_hello_packet` function determines the master/slave role. If the simulator is the master, it sends the first DD packet with the `I` (Initial), `M` (More), and `MS` (Master/Slave) bits set.
+4.  **ExStart State**: For Point-to-Point links, the state machine immediately proceeds from `2-WAY` to `EXSTART`. In this state, the two routers negotiate the master/slave relationship and agree on an initial DD sequence number.
+    *   **Master/Slave Election**: The router with the **higher Router ID** becomes the **master**.
+    *   **Negotiation Process**: The master sends an empty DD packet with the `I` (Initial), `M` (More), and `MS` (Master/Slave) bits set. The slave acknowledges this by sending its own empty DD packet with the `MS` bit cleared, echoing the master's sequence number. Once this empty packet exchange is complete, the negotiation is done, and both routers transition to the `EXCHANGE` state.
 
-5.  **Exchange State**: The routers exchange a series of DD packets to summarize their Link-State Databases (LSDBs).
-    *   Each DD packet contains a set of LSA headers.
-    *   The master increments the DD sequence number for each new packet, and the slave acknowledges by echoing the sequence number.
-    *   The `M` (More) bit is set in all but the final DD packet.
-    *   The `ospf_handle_dd_packet` function manages this exchange, sending and acknowledging DD packets until both routers have a complete picture of the other's LSDB summary.
-    *   **Note:** The current implementation uses a simplified DD exchange where it is assumed that all LSA headers can fit into a single DD packet. A fully compliant router would handle the case where multiple packets are needed.
+5.  **Exchange State**: Having established a master/slave relationship, the routers now exchange DD packets containing LSA headers to summarize their Link-State Databases (LSDBs).
+    *   The exchange follows a "poll-response" model. The master sends a DD packet with LSA headers and a new sequence number.
+    *   The slave acknowledges the master's packet by sending its own DD packet with the same sequence number, which contains its own LSA headers.
+    *   The `M` (More) bit is set in all but the final DD packet from each side. When a router has no more LSA headers to send, it clears the `M` bit in its last DD packet.
+    *   The `ospf_handle_dd_packet` function manages this entire state machine, ensuring RFC-compliant master/slave negotiation and LSA summary exchange.
 
 6.  **Loading State**: After the DD exchange is complete, each router knows which LSAs it is missing from its peer. The state transitions to `LOADING`.
     *   The simulator sends **Link-State Request (LSR)** packets to request the full details of any missing or outdated LSAs.
@@ -204,19 +203,24 @@ This section details the step-by-step packet exchange that occurs between the DP
         *   *DPDK receives this, sees its own Router ID, and moves the neighbor state to `2-WAY`.*
 
 2.  **Database Synchronization (ExStart -> Exchange)**
-    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X, Flags: I=1, M=1, MS=1)
-        *   *DPDK asserts its MASTER role and initiates the exchange with sequence number X.*
-    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X, Flags: M=1, MS=0)
-        *   *FRR (SLAVE) accepts DPDK as MASTER and acknowledges sequence number X.*
-    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=1)
-        *   *DPDK sends the first DD packet containing LSA headers.*
-    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=0)
-        *   *FRR acknowledges the packet and sends its own DD packet with LSA headers.*
-    *   *...This process of sending and acknowledging DD packets continues until both routers have sent all their LSA summaries...*
-    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=Y, Flags: M=0, MS=1)
-        *   *DPDK sends its final DD packet (the `More` bit is now 0).*
-    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=Y, Flags: M=0, MS=0)
-        *   *FRR acknowledges the final DD packet. The `Exchange` phase is complete, and both routers move to the `LOADING` state.*
+    *   *Both routers transition to `EXSTART` state after reaching `2-WAY`.*
+    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X, Flags: I=1, M=1, MS=1, Body: empty)
+        *   *DPDK (MASTER, higher Router ID) asserts its mastership and proposes initial sequence number X.*
+    *   *FRR (SLAVE, lower Router ID) may also send a similar packet, but it will eventually see and accept DPDK's packet due to the lower Router ID.*
+    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X, Flags: I=0, M=1, MS=0, Body: empty)
+        *   *FRR (now SLAVE) acknowledges DPDK's mastership by clearing the `I` and `MS` bits and echoing sequence number X. This packet is also empty.*
+    *   *Upon sending this, FRR moves to `EXCHANGE`. Upon receiving this, DPDK also moves to `EXCHANGE`. The negotiation is complete.*
+    *   --- *`EXCHANGE` State Begins* ---
+    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=1, Body: LSA Headers)
+        *   *DPDK (MASTER) sends the first packet containing LSA headers, incrementing the sequence number.*
+    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=0, Body: LSA Headers)
+        *   *FRR (SLAVE) acknowledges by echoing sequence number X+1 and sends its own LSA headers.*
+    *   *...This poll-response continues until all LSA headers are exchanged...*
+    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=Z, Flags: M=0, MS=1, Body: Final LSA Headers)
+        *   *DPDK sends its final DD packet, clearing the `M` (More) bit.*
+    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=Z, Flags: M=0, MS=0, Body: Final LSA Headers)
+        *   *FRR acknowledges the final packet and sends its own final packet (clearing the `M` bit).*
+    *   *Once both routers have acknowledged each other's final DD packets, they move to the `LOADING` state.*
 
 3.  **LSA Exchange (Loading -> Full)**
     *   `DPDK -> FRR (Unicast)`: **LSR Packet**
