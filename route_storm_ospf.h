@@ -213,6 +213,7 @@ typedef struct {
     uint8_t  is_dr;
     uint8_t  is_bdr;
     uint8_t  is_master;            /* For DD exchange */
+    uint8_t  initial_dd_sent;      /* Flag for initial DD packet */
     uint64_t last_hello_received;  /* TSC cycles */
     uint64_t last_dd_received;     /* TSC cycles */
     uint64_t last_dd_sent;         /* TSC cycles */

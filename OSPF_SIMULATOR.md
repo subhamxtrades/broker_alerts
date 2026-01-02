@@ -95,6 +95,7 @@ The simulator follows the standard OSPFv2 state machine to establish an adjacenc
     *   The master increments the DD sequence number for each new packet, and the slave acknowledges by echoing the sequence number.
     *   The `M` (More) bit is set in all but the final DD packet.
     *   The `ospf_handle_dd_packet` function manages this exchange, sending and acknowledging DD packets until both routers have a complete picture of the other's LSDB summary.
+    *   **Note:** The current implementation uses a simplified DD exchange where it is assumed that all LSA headers can fit into a single DD packet. A fully compliant router would handle the case where multiple packets are needed.
 
 6.  **Loading State**: After the DD exchange is complete, each router knows which LSAs it is missing from its peer. The state transitions to `LOADING`.
     *   The simulator sends **Link-State Request (LSR)** packets to request the full details of any missing or outdated LSAs.
