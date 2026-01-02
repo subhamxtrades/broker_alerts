@@ -1186,101 +1186,123 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
 
   nbr->last_dd_received = rte_get_tsc_cycles();
 
-  /* For point-to-point links, the exchange is simplified */
-  switch (nbr->state) {
-    case OSPF_STATE_EXSTART:
-        if (flags & OSPF_DD_FLAG_I && flags & OSPF_DD_FLAG_MS && ntohl(s->router_id) > ntohl(remote_rid)) {
-            // This is the deadlock case. We are master, but the peer is also claiming to be master.
-            // Since our Router ID is higher, we are the true master. We must re-assert this.
-            printf("[OSPF PID%u] Master conflict from peer %s. Re-asserting master role.\n",
-                   pid, ip_to_string(remote_rid));
-            ospf_send_dd_packet(pid, s, nbr->router_id, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, false, nbr->interface_index);
-            nbr->last_dd_sent = rte_get_tsc_cycles();
-        } else if (nbr->is_master) {
-            // We are the master. We are waiting for a slave DD packet that acknowledges our sequence number.
-            if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) && (dd_seq == nbr->dd_sequence)) {
-                printf("[OSPF PID%u] Received valid slave DD, moving to EXCHANGE\n", pid);
+    /* RFC 2328 Section 10.3 - Neighbor State Machine */
+    switch (nbr->state) {
+        case OSPF_STATE_EXSTART:
+            /* Master/Slave negotiation */
+            if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_MS) && (ntohl(remote_rid) > ntohl(s->router_id))) {
+                /* We are slave. Peer is master. His DD is superior. */
+                printf("[OSPF PID%u] [SLAVE] Peer is master. Adopting seq %u.\n", pid, dd_seq);
+                nbr->dd_sequence = dd_seq;
                 ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
-                // As master, we now increment the sequence number and send the first DD with LSA headers.
+
+                /* Send our first DD, echoing master's sequence, MS=0, but with our LSA headers */
+                ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, nbr->dd_sequence, true, iface_index);
+
+            } else if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) && (dd_seq == nbr->dd_sequence) && (ntohl(s->router_id) > ntohl(remote_rid))) {
+                /* We are master. Peer is slave and has accepted our mastership. */
+                printf("[OSPF PID%u] [MASTER] Peer is slave. Moving to EXCHANGE.\n", pid);
+                ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
+
+                /* Now we can start sending our LSA list */
+                /* Slave has sent its first DD (this packet), now we send our first *real* one */
                 nbr->dd_sequence++;
                 ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, true, iface_index);
+
+            } else if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_MS) && (ntohl(s->router_id) > ntohl(remote_rid))) {
+                /* Both think they are master. Our RID is higher, so we are correct. Re-send initial DD. */
+                 printf("[OSPF PID%u] [MASTER] Mastership conflict. Reasserting master status.\n", pid);
+                 ospf_send_dd_packet(pid, s, nbr->router_id, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, false, nbr->interface_index);
             }
-        } else {
-            // We are the slave. We are waiting for the master's initial DD packet.
-            if (flags & OSPF_DD_FLAG_I && flags & OSPF_DD_FLAG_MS) {
-                printf("[OSPF PID%u] Initial DD from master, moving to EXCHANGE\n", pid);
-                nbr->dd_sequence = dd_seq; // Adopt the master's sequence number
-                ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
-                // As slave, we reply with a DD packet echoing the sequence number, but with the MS bit cleared.
-                ospf_send_dd_packet(pid, s, remote_rid, 0, nbr->dd_sequence, false, iface_index);
+            break;
+
+        case OSPF_STATE_EXCHANGE:
+            /* Validate packet */
+            if ((flags & OSPF_DD_FLAG_I) ||
+                ((flags & OSPF_DD_FLAG_MS) && !nbr->is_master) ||
+                (!(flags & OSPF_DD_FLAG_MS) && nbr->is_master)) {
+                printf("[OSPF PID%u] Packet validation failed in EXCHANGE. Resetting.\n", pid);
+                ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXSTART);
+                return -1;
             }
-        }
-        break;
 
-    case OSPF_STATE_EXCHANGE:
-      if (flags & OSPF_DD_FLAG_I) {
-        /* FRR is retransmitting initial DD - this means it didn't see our response */
-        printf("[OSPF PID%u] FRR retransmitted initial DD, seq %u\n", pid, dd_seq);
+            if (nbr->is_master) {
+                /* We are MASTER. We only act when we receive a slave packet with matching seq num. */
+                if (dd_seq == nbr->dd_sequence) {
+                    printf("[OSPF PID%u] [MASTER] Slave acked seq %u.\n", pid, dd_seq);
 
-        /* Check if this is a new sequence number */
-        if (dd_seq != nbr->dd_sequence) {
-          printf("[OSPF PID%u] New DD sequence %u (was %u), restarting\n",
-                 pid, dd_seq, nbr->dd_sequence);
-          nbr->dd_sequence = dd_seq;
-          ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
-          ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
-        } else {
-          /* Same sequence - FRR missed our response, resend */
-          printf("[OSPF PID%u] Resending our DD with LSA headers\n", pid);
-          ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
-        }
-      } else {
-        /* Regular DD without I flag */
-        printf("[OSPF PID%u] FRR sent regular DD, seq %u, flags 0x%02x\n",
-               pid, dd_seq, flags);
+                    bool slave_has_more = (flags & OSPF_DD_FLAG_M);
 
-        if (has_lsa_headers) {
-          /* FRR sent DD with LSA headers - process them */
-          printf("[OSPF PID%u] FRR's DD contains LSA headers\n", pid);
+                    /* For now, our simple implementation sends all LSAs in the first packet. */
+                    /* So now we send our final, empty DD packet. */
+                    if (has_lsa_headers) {
+                        // In a real implementation, add these to a request list.
+                    }
 
-          /* If M flag is clear, this is the final DD */
-          if ((flags & OSPF_DD_FLAG_M) == 0) {
-            printf("[OSPF PID%u] FRR's final DD, moving to LOADING\n", pid);
-            ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
+                    if (slave_has_more) {
+                        /* Slave has more data. We just need to ack to poll for it. */
+                        nbr->dd_sequence++;
+                        printf("[OSPF PID%u] [MASTER] Slave has more. Polling with seq %u\n", pid, nbr->dd_sequence);
+                        ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_MS, nbr->dd_sequence, false, iface_index);
+                    } else {
+                        /* Slave is done, we are done. Exchange complete. */
+                        printf("[OSPF PID%u] [MASTER] Exchange complete. Moving to LOADING.\n", pid);
+                        ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
+                        // Optional: send one last empty DD as master to signal we are done too.
+                        // Let's rely on the timeout for now.
+                    }
+                } else {
+                     printf("[OSPF PID%u] [MASTER] Slave seq mismatch. Expected %u, got %u. Ignoring.\n", pid, nbr->dd_sequence, dd_seq);
+                }
 
-            /* Schedule LSR */
-            ospf_interface_t *iface = &s->interfaces[iface_index];
-            iface->exchange_state.step = 6;
-            iface->exchange_state.wait_until = rte_get_tsc_cycles() + (1 * rte_get_tsc_hz());
-          }
-        } else {
-          /* FRR sent empty DD without I flag - acknowledge */
-          printf("[OSPF PID%u] FRR sent empty DD, acknowledging\n", pid);
-          ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
+            } else {
+                /* We are SLAVE. We only send in response to a master packet. */
+                if (dd_seq == nbr->dd_sequence) {
+                    /* Master re-sent his last packet. We must re-send ours. */
+                    printf("[OSPF PID%u] [SLAVE] Master re-sent seq %u. Re-sending our DD.\n", pid, dd_seq);
+                    /* Simple implementation: after first DD, ours are empty. */
+                    ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
 
-          /* If M flag is clear and we haven't sent LSA headers, send them */
-          if ((flags & OSPF_DD_FLAG_M) == 0 && nbr->exchange_state.step == 0) {
-            printf("[OSPF PID%u] Sending our DD with LSA headers\n", pid);
-            ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
-            nbr->exchange_state.step = 1;
-          }
-        }
-      }
-      break;
+                } else if (dd_seq == nbr->dd_sequence + 1) {
+                    /* This is the next packet from the master. */
+                    nbr->dd_sequence = dd_seq;
+                    printf("[OSPF PID%u] [SLAVE] Master sent next seq %u.\n", pid, dd_seq);
 
-    case OSPF_STATE_LOADING:
-    case OSPF_STATE_FULL:
-      /* In LOADING or FULL state, just acknowledge any DD packets */
-      printf("[OSPF PID%u] In %s state, acknowledging DD\n",
-             pid, ospf_state_to_string(nbr->state));
-      ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
-      break;
+                    if (has_lsa_headers) {
+                       // Process LSA headers here
+                    }
 
-    default:
-      printf("[OSPF PID%u] Received DD in unexpected state %s\n",
-             pid, ospf_state_to_string(nbr->state));
-      break;
-  }
+                    bool master_has_more = (flags & OSPF_DD_FLAG_M);
+                    if (!master_has_more) {
+                        /* Master is done. If we are also done, move to LOADING. */
+                        printf("[OSPF PID%u] [SLAVE] Exchange complete. Moving to LOADING.\n", pid);
+                        ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
+                    }
+                    /* Acknowledge master's packet. We are simple, so we are done. Send M=0. */
+                    ospf_send_dd_packet(pid, s, remote_rid, 0, nbr->dd_sequence, false, iface_index);
+                } else {
+                    printf("[OSPF PID%u] [SLAVE] Master seq mismatch. Expected %u or %u, got %u. Resetting.\n", pid, nbr->dd_sequence, nbr->dd_sequence+1, dd_seq);
+                    ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXSTART);
+                    return -1;
+                }
+            }
+            break;
+
+        case OSPF_STATE_LOADING:
+        case OSPF_STATE_FULL:
+            /* Should only see duplicate DDs here. If it's an old one, just reply to shut the neighbor up. */
+            if (dd_seq == nbr->dd_sequence && !nbr->is_master) {
+                ospf_send_dd_packet(pid, s, remote_rid, 0, dd_seq, false, iface_index);
+            } else if (dd_seq < nbr->dd_sequence && nbr->is_master) {
+                // Ignore slave's retransmission
+            }
+            break;
+
+        default:
+            printf("[OSPF PID%u] Received DD in unexpected state %s\n",
+                   pid, ospf_state_to_string(nbr->state));
+            break;
+    }
 
   return 0;
 }
