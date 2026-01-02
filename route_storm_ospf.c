@@ -1072,27 +1072,8 @@ int ospf_handle_hello_packet(struct ethernet_hdr *eth_hdr,
       /* Send Hello response WITH FRR in neighbor list */
       ospf_send_hello_packet(pid, s, iface_index);
 
-      /* Move to EXSTART immediately for point-to-point */
-      printf("[OSPF PID%u] Moving to EXSTART\n", pid);
-      ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXSTART);
-
-      if (ntohl(s->router_id) > ntohl(remote_rid)) {
-        nbr->is_master = 1;
-        char local_rid_str[16], remote_rid_str[16];
-        snprintf(local_rid_str, sizeof(local_rid_str), "%s", ip_to_string(s->router_id));
-        snprintf(remote_rid_str, sizeof(remote_rid_str), "%s", ip_to_string(remote_rid));
-        printf("[OSPF PID%u] We are MASTER for FRR (RID %s > %s)\n",
-               pid, local_rid_str, remote_rid_str);
-      } else {
-        nbr->is_master = 0;  /* We are slave */
-        char local_rid_str[16], remote_rid_str[16];
-        snprintf(local_rid_str, sizeof(local_rid_str), "%s", ip_to_string(s->router_id));
-        snprintf(remote_rid_str, sizeof(remote_rid_str), "%s", ip_to_string(remote_rid));
-        printf("[OSPF PID%u] We are SLAVE for FRR (RID %s < %s)\n",
-            pid, local_rid_str, remote_rid_str);
-      }
-
-      /* The main loop will now handle sending the initial DD packet */
+      /* For P2P, the state machine can proceed. The main loop will handle the transition to ExStart. */
+      printf("[OSPF PID%u] Reached 2-WAY. Main loop will now handle ExStart transition.\n", pid);
     } else if (nbr->state >= OSPF_STATE_EXSTART && nbr->state <= OSPF_STATE_EXCHANGE) {
       /* During DD exchange, FRR might temporarily not include us in Hello */
       /* This is normal - just send Hello to maintain */
@@ -1625,6 +1606,31 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
 
     /* Process neighbor timeouts */
     ospf_process_neighbor_timeouts(s, pid);
+
+    /* Check for neighbors in 2-Way state to start the exchange */
+    for (int i = 0; i < s->neighbor_count; i++) {
+        ospf_neighbor_t *n = &s->neighbors[i];
+        if (n->state == OSPF_STATE_TWO_WAY) {
+            printf("[OSPF PID%u] Neighbor %s is 2-WAY, proceeding to EXSTART.\n", pid, ip_to_string(n->router_id));
+            ospf_update_neighbor_state(s, n->router_id, n->interface_index, OSPF_STATE_EXSTART);
+
+            if (ntohl(s->router_id) > ntohl(n->router_id)) {
+                n->is_master = 1;
+                char local_rid_str[16], remote_rid_str[16];
+                snprintf(local_rid_str, sizeof(local_rid_str), "%s", ip_to_string(s->router_id));
+                snprintf(remote_rid_str, sizeof(remote_rid_str), "%s", ip_to_string(n->router_id));
+                printf("[OSPF PID%u] We are MASTER for %s (RID %s > %s)\n",
+                       pid, remote_rid_str, local_rid_str, remote_rid_str);
+            } else {
+                n->is_master = 0;
+                char local_rid_str[16], remote_rid_str[16];
+                snprintf(local_rid_str, sizeof(local_rid_str), "%s", ip_to_string(s->router_id));
+                snprintf(remote_rid_str, sizeof(remote_rid_str), "%s", ip_to_string(n->router_id));
+                printf("[OSPF PID%u] We are SLAVE for %s (RID %s < %s)\n",
+                    pid, remote_rid_str, local_rid_str, remote_rid_str);
+            }
+        }
+    }
 
     /* Check for neighbors needing initial DD packet */
     for (int i = 0; i < s->neighbor_count; i++) {
