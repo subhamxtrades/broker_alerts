@@ -159,3 +159,51 @@ Once configured, you can verify the OSPF adjacency on the FRR router using the f
     show ip ospf interface eth1
     ```
     This command will show detailed information about the OSPF configuration on the interface, including the network type, timers, and neighbor count.
+
+## 5. Typical Packet Exchange Flow (DPDK <-> FRR)
+
+This section details the step-by-step packet exchange that occurs between the DPDK simulator and an FRR router during a successful adjacency formation.
+
+**Assumptions:**
+*   DPDK Simulator Router ID: `2.2.2.2`
+*   FRR Router ID: `1.1.1.1`
+*   Based on the Router IDs, the **DPDK simulator will be the MASTER** for the DD exchange.
+
+---
+
+1.  **Neighbor Discovery (Down -> 2-Way)**
+    *   `DPDK -> Multicast`: **Hello** (Neighbors list: empty)
+    *   `FRR -> Multicast`: **Hello** (Neighbors list: empty)
+        *   *DPDK receives this, adds FRR as a neighbor, and moves its state to `INIT`.*
+    *   `DPDK -> Multicast`: **Hello** (Neighbors list: `1.1.1.1`)
+        *   *FRR receives this, sees its own Router ID, and moves the neighbor state to `2-WAY`.*
+    *   `FRR -> Multicast`: **Hello** (Neighbors list: `2.2.2.2`)
+        *   *DPDK receives this, sees its own Router ID, and moves the neighbor state to `2-WAY`.*
+
+2.  **Database Synchronization (ExStart -> Exchange)**
+    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X, Flags: I=1, M=1, MS=1)
+        *   *DPDK asserts its MASTER role and initiates the exchange with sequence number X.*
+    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X, Flags: M=1, MS=0)
+        *   *FRR (SLAVE) accepts DPDK as MASTER and acknowledges sequence number X.*
+    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=1)
+        *   *DPDK sends the first DD packet containing LSA headers.*
+    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=0)
+        *   *FRR acknowledges the packet and sends its own DD packet with LSA headers.*
+    *   *...This process of sending and acknowledging DD packets continues until both routers have sent all their LSA summaries...*
+    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=Y, Flags: M=0, MS=1)
+        *   *DPDK sends its final DD packet (the `More` bit is now 0).*
+    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=Y, Flags: M=0, MS=0)
+        *   *FRR acknowledges the final DD packet. The `Exchange` phase is complete, and both routers move to the `LOADING` state.*
+
+3.  **LSA Exchange (Loading -> Full)**
+    *   `DPDK -> FRR (Unicast)`: **LSR Packet**
+        *   *DPDK requests the full LSA for any database entries learned from FRR in the `Exchange` phase.*
+    *   `FRR -> DPDK (Unicast)`: **LSU Packet**
+        *   *FRR responds with the requested LSA(s) in an LSU packet.*
+    *   `DPDK -> FRR (Unicast)`: **LSAck Packet**
+        *   *DPDK sends an acknowledgment for the received LSU.*
+    *   *(This LSR/LSU/LSAck exchange also happens in the other direction, with FRR requesting LSAs from DPDK).*
+
+4.  **Adjacency Formed (Full)**
+    *   Once both routers have received and acknowledged all necessary LSAs, the neighbor state transitions to `FULL`.
+    *   The routers now periodically exchange **Hello** packets to maintain the adjacency.
