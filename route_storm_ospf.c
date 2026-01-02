@@ -1189,32 +1189,33 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
   /* For point-to-point links, the exchange is simplified */
   switch (nbr->state) {
     case OSPF_STATE_EXSTART:
-      if (nbr->is_master) {
-        if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) && (dd_seq == nbr->dd_sequence)) {
-            printf("[OSPF PID%u] Received DD from slave, moving to EXCHANGE\n", pid);
-            ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
-            ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, ++nbr->dd_sequence, true, iface_index);
+        if (flags & OSPF_DD_FLAG_I && flags & OSPF_DD_FLAG_MS && ntohl(s->router_id) > ntohl(remote_rid)) {
+            // This is the deadlock case. We are master, but the peer is also claiming to be master.
+            // Since our Router ID is higher, we are the true master. We must re-assert this.
+            printf("[OSPF PID%u] Master conflict from peer %s. Re-asserting master role.\n",
+                   pid, ip_to_string(remote_rid));
+            ospf_send_dd_packet(pid, s, nbr->router_id, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, false, nbr->interface_index);
+            nbr->last_dd_sent = rte_get_tsc_cycles();
+        } else if (nbr->is_master) {
+            // We are the master. We are waiting for a slave DD packet that acknowledges our sequence number.
+            if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) && (dd_seq == nbr->dd_sequence)) {
+                printf("[OSPF PID%u] Received valid slave DD, moving to EXCHANGE\n", pid);
+                ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
+                // As master, we now increment the sequence number and send the first DD with LSA headers.
+                nbr->dd_sequence++;
+                ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, true, iface_index);
+            }
+        } else {
+            // We are the slave. We are waiting for the master's initial DD packet.
+            if (flags & OSPF_DD_FLAG_I && flags & OSPF_DD_FLAG_MS) {
+                printf("[OSPF PID%u] Initial DD from master, moving to EXCHANGE\n", pid);
+                nbr->dd_sequence = dd_seq; // Adopt the master's sequence number
+                ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
+                // As slave, we reply with a DD packet echoing the sequence number, but with the MS bit cleared.
+                ospf_send_dd_packet(pid, s, remote_rid, 0, nbr->dd_sequence, false, iface_index);
+            }
         }
-      } else {
-          if (flags & OSPF_DD_FLAG_I) {
-            /* Initial DD from FRR (master) - store sequence number */
-            printf("[OSPF PID%u] Initial DD from FRR (master), storing seq %u\n", pid, dd_seq);
-            nbr->dd_sequence = dd_seq;
-
-            /* Move to EXCHANGE state */
-            ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
-
-            /* CRITICAL FIX: For P2P, send our DD with LSA headers immediately */
-            printf("[OSPF PID%u] For P2P: Sending our DD with LSA headers immediately\n", pid);
-            ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, dd_seq, true, iface_index);
-
-            /* Set exchange state */
-            nbr->exchange_state.step = 1;
-            nbr->exchange_state.waiting_for = OSPF_TYPE_DD;
-            nbr->exchange_state.wait_until = rte_get_tsc_cycles() + (10 * rte_get_tsc_hz());
-          }
-      }
-      break;
+        break;
 
     case OSPF_STATE_EXCHANGE:
       if (flags & OSPF_DD_FLAG_I) {
