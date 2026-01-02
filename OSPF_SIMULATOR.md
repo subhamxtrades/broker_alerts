@@ -104,39 +104,54 @@ The simulator follows the standard OSPFv2 state machine to establish an adjacenc
 
 7.  **Full State**: Once the LSDBs of the two routers are fully synchronized, the neighbor state transitions to `FULL`. The adjacency is complete, and the routers can now include each other in their SPF (Shortest Path First) calculations.
 
-## 4. Sample FRR Configuration
+## 4. Sample FRR Configuration (Dual-Port)
 
-This section provides a sample configuration for an FRR router to establish an OSPF adjacency with the simulator. This configuration should be applied using FRR's integrated shell, `vtysh`.
+This section provides a sample configuration for an FRR router to establish OSPF adjacencies with a dual-port DPDK simulator setup.
 
 ### Assumptions
 
-*   The FRR router has an interface (e.g., `eth1`) connected to the same Layer 2 network as the DPDK port `0` used by the simulator.
-*   The simulator is running on DPDK port `0`, which is configured with the IP address `192.168.1.100/24`.
-*   The FRR router's interface will be configured with the IP address `192.168.1.1/24`.
+This configuration assumes the following network topology:
 
-### Configuration Steps
+*   **Link 1**:
+    *   The FRR router's `ens37` interface is connected to the same Layer 2 network as DPDK **Port 0**.
+    *   FRR `ens37` IP: `192.168.1.1/24`.
+    *   DPDK Port 0 IP: `192.168.1.100/24` (Router ID: `2.2.2.2`).
+*   **Link 2**:
+    *   The FRR router's `ens38` interface is connected to the same Layer 2 network as DPDK **Port 1**.
+    *   FRR `ens38` IP: `192.168.2.1/24`.
+    *   DPDK Port 1 IP: `192.168.2.100/24` (Router ID: `3.3.3.3`).
+*   The FRR router itself has a Router ID of `1.1.1.1`.
+
+### FRR Configuration
+
+The following configuration can be applied to FRR using its integrated shell, `vtysh`. This is based on the running configuration provided by the user.
 
 ```shell
 # Enter configuration mode
 configure terminal
 
-# Configure the network interface
-interface eth1
+# --- Configure Interfaces ---
+interface ens37
  ip address 192.168.1.1/24
-!
-# Enter OSPF router configuration mode
-router ospf
- # Set the OSPF Router ID. This must match what the simulator expects.
- ospf router-id 1.1.1.1
- # Announce the directly connected network. This enables OSPF on the interface.
- network 192.168.1.0/24 area 0.0.0.0
-!
-# (Optional) Set the interface's network type to point-to-point
-# This should be detected automatically from the simulator's Hello packets,
-# but can be set explicitly for clarity.
-interface eth1
  ip ospf network point-to-point
+exit
 !
+interface ens38
+ ip address 192.168.2.1/24
+ ip ospf network point-to-point
+exit
+!
+
+# --- Configure OSPF Process ---
+router ospf
+ # Set the OSPF Router ID for FRR
+ ospf router-id 1.1.1.1
+ # Announce the networks. This enables OSPF on the corresponding interfaces.
+ network 192.168.1.0/24 area 0.0.0.0
+ network 192.168.2.0/24 area 0.0.0.0
+exit
+!
+
 # Exit configuration mode
 end
 
@@ -146,26 +161,33 @@ write
 
 ### Verification
 
-Once configured, you can verify the OSPF adjacency on the FRR router using the following commands in `vtysh`:
+Once configured, you can verify the OSPF adjacencies on the FRR router using the following commands in `vtysh`:
 
 *   **Check neighbor status**:
     ```shell
     show ip ospf neighbor
     ```
-    The output should show the simulator's Router ID (`2.2.2.2`) in the `FULL` state.
+    The output should show **two** neighbors: the simulator's Router IDs for both ports (`2.2.2.2` and `3.3.3.3`), both in the `FULL` state.
 
-*   **Check the OSPF interface**:
-    ```shell
-    show ip ospf interface eth1
     ```
-    This command will show detailed information about the OSPF configuration on the interface, including the network type, timers, and neighbor count.
+    Neighbor ID     Pri   State           Dead Time   Address         Interface                        RXmtL RtrdQL
+    2.2.2.2         1     Full/ -         00:00:35    192.168.1.100   ens37:192.168.1.1                  0     0
+    3.3.3.3         1     Full/ -         00:00:38    192.168.2.100   ens38:192.168.2.1                  0     0
+    ```
+
+*   **Check the OSPF interfaces**:
+    ```shell
+    show ip ospf interface ens37
+    show ip ospf interface ens38
+    ```
+    These commands will show detailed information for each interface, confirming the network type is Point-to-Point and that a neighbor has been detected.
 
 ## 5. Typical Packet Exchange Flow (DPDK <-> FRR)
 
-This section details the step-by-step packet exchange that occurs between the DPDK simulator and an FRR router during a successful adjacency formation.
+This section details the step-by-step packet exchange that occurs between the DPDK simulator and an FRR router during a successful adjacency formation. The same process occurs concurrently on both links.
 
-**Assumptions:**
-*   DPDK Simulator Router ID: `2.2.2.2`
+**Assumptions (for Link 1):**
+*   DPDK Simulator (Port 0) Router ID: `2.2.2.2`
 *   FRR Router ID: `1.1.1.1`
 *   Based on the Router IDs, the **DPDK simulator will be the MASTER** for the DD exchange.
 
