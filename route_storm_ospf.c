@@ -1066,7 +1066,7 @@ int ospf_handle_hello_packet(struct ethernet_hdr *eth_hdr,
 
   if (found_ourselves) {
     /* FRR listed us in its Hello */
-    if (nbr->state == OSPF_STATE_INIT) {
+    if (nbr->state < OSPF_STATE_TWO_WAY) {
       ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_TWO_WAY);
 
       /* Send Hello response WITH FRR in neighbor list */
@@ -1177,6 +1177,15 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
     return -1;
   }
 
+  /* Per RFC 2328, DD packets are ignored in states < ExStart */
+  if (nbr->state < OSPF_STATE_EXSTART) {
+    char rid_str[16];
+    snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(remote_rid));
+    printf("[OSPF PID%u] Received DD from %s in state %s, ignoring packet.\n",
+        pid, rid_str, ospf_state_to_string(nbr->state));
+    return 0;
+  }
+
   nbr->last_dd_received = rte_get_tsc_cycles();
 
   /* RFC 2328 Section 10.8: Receiving Database Description Packets */
@@ -1225,11 +1234,11 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
         break;
 
     case OSPF_STATE_EXCHANGE:
-        /* Packet Validation */
-        if (((flags & OSPF_DD_FLAG_I)) ||
-            ((flags & OSPF_DD_FLAG_MS) != nbr->is_master) ||
-            (dd_seq != nbr->dd_sequence && nbr->is_master) ||
-            (dd_seq != nbr->dd_sequence + 1 && !nbr->is_master)) {
+        /* Packet Validation: I-bit must be 0, MS-bit must be opposite of ours, and sequence numbers must match expectations. */
+        if ((flags & OSPF_DD_FLAG_I) ||
+            ((flags & OSPF_DD_FLAG_MS) == nbr->is_master) ||
+            (nbr->is_master && (dd_seq != nbr->dd_sequence)) ||
+            (!nbr->is_master && (dd_seq != nbr->dd_sequence + 1))) {
             printf("[OSPF PID%u] [EXCHANGE] DD packet from %s failed validation. Resetting.\n", pid, ip_to_string(remote_rid));
             ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXSTART);
             return -1;
