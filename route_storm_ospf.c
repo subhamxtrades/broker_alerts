@@ -379,7 +379,7 @@ int ospf_send_packet(uint8_t pid, ospf_session_t *s, uint8_t type,
   snprintf(src_str, sizeof(src_str), "%s", ip_to_string(src_ip));
   snprintf(dst_str, sizeof(dst_str), "%s", ip_to_string(dst_ip));
 
-  printf("[OSPF PID%u] >>> SENT: %s from Router %s (%s) to %s, length=%u bytes\n",
+  printf("[PID %u] >>> SEND %-5s | RID: %-15s | SRC: %-15s | DST: %-15s | LEN: %u\n",
       pid, tname, rid_str, src_str, dst_str, frame_len);
 
   switch (type) {
@@ -466,15 +466,17 @@ int ospf_send_hello_packet(uint8_t pid, ospf_session_t *s, uint8_t iface_index)
   snprintf(iface_str, sizeof(iface_str), "%s", ip_to_string(iface->ip_address));
   snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(s->router_id));
 
-  printf("[OSPF PID%u] Sending Hello on point-to-point interface %s: Router %s, Neighbors: %u, Packet size=%u bytes\n",
-      pid, iface_str, rid_str, neighbor_count, total_packet_size);
-
   if (neighbor_count > 0) {
-    printf("[OSPF PID%u] Hello includes neighbor(s):", pid);
+    char neighbor_list_str[128] = {0};
     for (int i = 0; i < neighbor_count; i++) {
-      printf(" %s", ip_to_string(nbr_ids[i]));
+        strncat(neighbor_list_str, ip_to_string(nbr_ids[i]), sizeof(neighbor_list_str) - strlen(neighbor_list_str) - 1);
+        if (i < neighbor_count - 1) {
+            strncat(neighbor_list_str, ", ", sizeof(neighbor_list_str) - strlen(neighbor_list_str) - 1);
+        }
     }
-    printf("\n");
+    printf("[PID %u] INFO  | Sending Hello on %s (Neighbors: %s)\n", pid, iface_str, neighbor_list_str);
+  } else {
+    printf("[PID %u] INFO  | Sending Hello on %s (Neighbors: 0)\n", pid, iface_str);
   }
 
   /* Per RFC 2328, Hello packets are sent to the AllSPFRouters multicast address. */
@@ -562,17 +564,12 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
   snprintf(dst_str, sizeof(dst_str), "%s", ip_to_string(dst_ip));
   snprintf(iface_str, sizeof(iface_str), "%s", ip_to_string(iface->ip_address));
 
-  printf("[OSPF PID%u] Sending DD to %s (%s) flags 0x%02x seq %u on %s interface %s\n",
-      pid, rid_str, dst_str, dd->flags, dd_seq,
-      iface->type == OSPF_IFTYPE_P2P ? "P2P" : "BROADCAST",
-      iface_str);
-  printf("[OSPF PID%u] DD Send Flags: I=%u, M=%u, MS=%u, MTU=%u, Total len=%u\n",
-      pid,
+  printf("[PID %u] INFO  | Sending DD to %s on %s | Seq: %u, Flags: [I:%u, M:%u, MS:%u], MTU: %u\n",
+      pid, rid_str, iface_str, dd_seq,
       (dd->flags & OSPF_DD_FLAG_I) ? 1 : 0,
       (dd->flags & OSPF_DD_FLAG_M) ? 1 : 0,
       (dd->flags & OSPF_DD_FLAG_MS) ? 1 : 0,
-      ntohs(dd->mtu),
-      total_len);
+      ntohs(dd->mtu));
 
   int ret = ospf_send_packet(pid, s, OSPF_TYPE_DD, buf, total_len, dst_ip, iface->ip_address);
   free(buf);
@@ -600,8 +597,8 @@ int ospf_send_lsr_packet(uint8_t pid, ospf_session_t *s,
   snprintf(dst_str, sizeof(dst_str), "%s", ip_to_string(dst_ip));
   snprintf(iface_str, sizeof(iface_str), "%s", ip_to_string(iface->ip_address));
 
-  printf("[OSPF PID%u] Sending LSR to %s (%s) for LSA type %u on point-to-point interface %s\n",
-      pid, rid_str, dst_str, ls_type, iface_str);
+  printf("[PID %u] INFO  | Sending LSR to %s for LSA Type %u on %s\n",
+      pid, rid_str, ls_type, iface_str);
 
   return ospf_send_packet(pid, s, OSPF_TYPE_LSR, &lsr, sizeof(lsr), dst_ip, iface->ip_address);
 }
@@ -737,8 +734,8 @@ int ospf_send_lsu_packet(uint8_t pid, ospf_session_t *s,
   snprintf(dst_str, sizeof(dst_str), "%s", ip_to_string(dst_ip));
   snprintf(iface_str, sizeof(iface_str), "%s", ip_to_string(iface->ip_address));
 
-  printf("[OSPF PID%u] Sending LSU with %u LSA(s) to %s (%s) on point-to-point interface %s\n",
-      pid, lsa_count, rid_str, dst_str, iface_str);
+  printf("[PID %u] INFO  | Sending LSU with %u LSA(s) to %s on %s\n",
+      pid, lsa_count, rid_str, iface_str);
 
   int ret = ospf_send_packet(pid, s, OSPF_TYPE_LSU, buf, total_len, dst_ip, iface->ip_address);
   free(buf);
@@ -762,7 +759,7 @@ int ospf_send_lsack_packet(uint8_t pid, ospf_session_t *s,
 
     uint32_t dst_ip = string_to_ip(OSPF_ALLSPFROUTERS_MCAST);
 
-    printf("[OSPF PID%u] Sending LSAck to %s for %u LSAs\n", pid, ip_to_string(neighbor_rid), lsa_count);
+    printf("[PID %u] INFO  | Sending LSAck to %s for %u LSA(s)\n", pid, ip_to_string(neighbor_rid), lsa_count);
 
     int ret = ospf_send_packet(pid, s, OSPF_TYPE_LSACK, buf, payload_len, dst_ip, iface->ip_address);
     free(buf);
@@ -798,21 +795,19 @@ void ospf_update_neighbor_state(ospf_session_t *s,
         s->neighbors[i].dd_sequence = (rte_rand() & 0xffffff);
     }
 
-      char rid_str[16];
       snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(neighbor_rid));
-      printf("[OSPF PID%u] Neighbor %s (interface %u) state: %s -> %s\n",
+      printf("[PID %u] STATE | Neighbor %-15s | %s -> %s\n",
           s->pid,
           rid_str,
-          interface_index,
           ospf_state_to_string(old),
           ospf_state_to_string(new_state));
 
       if (new_state == OSPF_STATE_FULL) {
         s->config.neighbors_full++;
-        char rid_str[16];
-        snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(neighbor_rid));
-        printf("[OSPF PID%u] *** Adjacency with %s established (FULL) ***\n",
-            s->pid, rid_str);
+        char n_rid_str[16];
+        snprintf(n_rid_str, sizeof(n_rid_str), "%s", ip_to_string(neighbor_rid));
+        printf("[PID %u] SUCCESS | *** Adjacency with %s is FULL ***\n",
+            s->pid, n_rid_str);
       }
       return;
     }
@@ -913,17 +908,10 @@ int ospf_handle_hello_packet(struct ethernet_hdr *eth_hdr,
   }
 
   ospf_interface_t *iface = &s->interfaces[iface_index];
-
-  printf("[OSPF PID%u] <<< RECEIVED: Hello from Router %s (1.1.1.1) on point-to-point interface %u, packet size analysis:\n",
-      pid, ip_to_string(remote_rid), iface_index);
-
-  /* Calculate packet size for debugging */
   uint16_t ospf_len = ntohs(hdr->length);
-  uint16_t total_packet_size = sizeof(struct ethernet_hdr) +
-    sizeof(struct iphdr) +
-    ospf_len;
-  printf("[OSPF PID%u] OSPF length: %u bytes, Total packet: ~%u bytes\n",
-      pid, ospf_len, total_packet_size);
+
+  printf("[PID %u] <<< RECV  %-5s | RID: %-15s | SRC: %-15s | IFACE: %u | LEN: %u\n",
+      pid, "Hello", ip_to_string(remote_rid), ip_to_string(src_ip), iface_index, ospf_len);
 
   if (remote_area != s->area_id) {
     char local_area_str[16], remote_area_str[16];
@@ -957,21 +945,25 @@ int ospf_handle_hello_packet(struct ethernet_hdr *eth_hdr,
     neighbor_count_in_hello = (total_len - base) / sizeof(uint32_t);
     uint32_t *nbr_ids = (uint32_t *)(hello + 1);
 
-    printf("[OSPF PID%u] Hello contains %u neighbor(s): ", pid, neighbor_count_in_hello);
+    char neighbor_list_str[128] = {0};
     for (int i = 0; i < neighbor_count_in_hello; i++) {
-      uint32_t nid = nbr_ids[i]; /* net order */
-      printf("%s ", ip_to_string(nid));
-      if (nid == s->router_id) {
-        found_ourselves = true;
-      }
+        uint32_t nid = nbr_ids[i];
+        strncat(neighbor_list_str, ip_to_string(nid), sizeof(neighbor_list_str) - strlen(neighbor_list_str) - 1);
+        if (i < neighbor_count_in_hello - 1) {
+            strncat(neighbor_list_str, ", ", sizeof(neighbor_list_str) - strlen(neighbor_list_str) - 1);
+        }
+        if (nid == s->router_id) {
+            found_ourselves = true;
+        }
     }
-    printf("\n");
+    printf("[PID %u] INFO  | Hello from %s contains %d neighbor(s): [%s]\n",
+        pid, ip_to_string(remote_rid), neighbor_count_in_hello, neighbor_list_str);
 
     if (found_ourselves) {
-      printf("[OSPF PID%u] *** Found ourselves in FRR's Hello (2-WAY) ***\n", pid);
+      printf("[PID %u] INFO  | Bidirectional communication established with %s (2-WAY)\n", pid, ip_to_string(remote_rid));
     }
   } else {
-    printf("[OSPF PID%u] Hello contains 0 neighbors\n", pid);
+    printf("[PID %u] INFO  | Hello from %s contains 0 neighbors\n", pid, ip_to_string(remote_rid));
   }
 
   /* Find or create neighbor entry */
@@ -1008,8 +1000,8 @@ int ospf_handle_hello_packet(struct ethernet_hdr *eth_hdr,
     n->exchange_state.waiting_for = 0;
     n->exchange_state.wait_until = 0;
 
-    printf("[OSPF PID%u] New OSPF neighbor discovered: FRR (1.1.1.1) on point-to-point interface %u\n",
-        pid, iface_index);
+    printf("[PID %u] INFO  | New neighbor discovered: %s on interface %u\n",
+        pid, ip_to_string(remote_rid), iface_index);
 
     ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_INIT);
   } else {
@@ -1088,17 +1080,18 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
     }
   }
 
-  printf("[OSPF PID%u] <<< RECEIVED: DD from FRR (1.1.1.1) seq %u flags 0x%02x on interface %u\n",
-      pid, dd_seq, flags, iface_index);
-  printf("[OSPF PID%u] DD Flags: I=%u, M=%u, MS=%u\n",
-      pid,
+  uint16_t ospf_len = ntohs(hdr->length);
+  bool has_lsa_headers = dd_contains_lsa_headers(hdr, dd);
+
+  printf("[PID %u] <<< RECV  %-5s | RID: %-15s | SRC: %-15s | IFACE: %u | LEN: %u\n",
+      pid, "DD", ip_to_string(remote_rid), ip_to_string(src_ip), iface_index, ospf_len);
+
+  printf("[PID %u] INFO  | DD from %s | Seq: %u, Flags: [I:%u, M:%u, MS:%u], Has LSA: %s\n",
+      pid, ip_to_string(remote_rid), dd_seq,
       (flags & OSPF_DD_FLAG_I) ? 1 : 0,
       (flags & OSPF_DD_FLAG_M) ? 1 : 0,
-      (flags & OSPF_DD_FLAG_MS) ? 1 : 0);
-
-  /* Check if DD contains LSA headers */
-  bool has_lsa_headers = dd_contains_lsa_headers(hdr, dd);
-  printf("[OSPF PID%u] DD contains LSA headers: %s\n", pid, has_lsa_headers ? "YES" : "NO");
+      (flags & OSPF_DD_FLAG_MS) ? 1 : 0,
+      has_lsa_headers ? "YES" : "NO");
 
   ospf_neighbor_t *nbr = NULL;
   for (int i = 0; i < s->neighbor_count; i++) {
@@ -1109,7 +1102,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
     }
   }
   if (!nbr) {
-    printf("[OSPF PID%u] DD from unknown FRR neighbor\n", pid);
+    printf("[PID %u] WARN  | DD from unknown neighbor %s\n", pid, ip_to_string(remote_rid));
     return -1;
   }
 
@@ -1130,13 +1123,13 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
     case OSPF_STATE_ATTEMPT:
     case OSPF_STATE_TWO_WAY:
         /* DD packets are not expected in these states. Ignore. */
-        printf("[OSPF PID%u] Received DD packet from %s in unexpected state %s. Ignoring.\n",
+        printf("[PID %u] WARN  | Received DD from %s in unexpected state %s. Ignoring.\n",
                pid, ip_to_string(remote_rid), ospf_state_to_string(nbr->state));
         break;
 
     case OSPF_STATE_INIT:
         /* This is an error, should have transitioned to 2-Way first. Resetting. */
-        printf("[OSPF PID%u] Received DD packet from %s in INIT state. This is an error. Resetting neighbor.\n",
+        printf("[PID %u] ERROR | Received DD from %s in INIT state. Resetting neighbor.\n",
                pid, ip_to_string(remote_rid));
         ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_DOWN);
         break;
@@ -1145,7 +1138,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
         if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_M) && (flags & OSPF_DD_FLAG_MS) &&
             !has_lsa_headers && (ntohl(remote_rid) > ntohl(s->router_id))) {
             /* Peer is master, we must be slave. */
-            printf("[OSPF PID%u] [EXSTART] Peer %s is MASTER. We are SLAVE.\n", pid, ip_to_string(remote_rid));
+            printf("[PID %u] STATE | [EXSTART] Peer %s is MASTER. We are SLAVE.\n", pid, ip_to_string(remote_rid));
             nbr->is_master = 0;
             nbr->dd_sequence = dd_seq;
             ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
@@ -1155,7 +1148,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
         } else if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) &&
                    (dd_seq == nbr->dd_sequence) && (ntohl(s->router_id) > ntohl(remote_rid))) {
             /* We are master, and slave has acknowledged our mastership. */
-            printf("[OSPF PID%u] [EXSTART] Peer %s is SLAVE. Moving to EXCHANGE.\n", pid, ip_to_string(remote_rid));
+            printf("[PID %u] STATE | [EXSTART] Peer %s is SLAVE. Moving to EXCHANGE.\n", pid, ip_to_string(remote_rid));
             ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
             /* Start sending our DD summary */
             nbr->dd_sequence++;
@@ -1163,7 +1156,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
 
         } else if ((flags & OSPF_DD_FLAG_I) && (ntohl(s->router_id) > ntohl(remote_rid))) {
              /* Mastership conflict. Our RID is higher, so we re-send our initial DD packet to assert master. */
-             printf("[OSPF PID%u] [EXSTART] Mastership conflict with %s. Re-asserting master role.\n",
+             printf("[PID %u] WARN  | [EXSTART] Mastership conflict with %s. Re-asserting master role.\n",
                     pid, ip_to_string(remote_rid));
              ospf_send_dd_packet(pid, s, nbr->router_id, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, false, nbr->interface_index);
         }
@@ -1175,7 +1168,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
             ((flags & OSPF_DD_FLAG_MS) == nbr->is_master) ||
             (nbr->is_master && (dd_seq != nbr->dd_sequence)) ||
             (!nbr->is_master && (dd_seq != nbr->dd_sequence + 1))) {
-            printf("[OSPF PID%u] [EXCHANGE] DD packet from %s failed validation. Resetting.\n", pid, ip_to_string(remote_rid));
+            printf("[PID %u] ERROR | [EXCHANGE] DD packet from %s failed validation. Resetting.\n", pid, ip_to_string(remote_rid));
             ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXSTART);
             return -1;
         }
@@ -1210,7 +1203,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
                     ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_MS, nbr->dd_sequence, false, iface_index);
                 } else {
                     /* Neither has more. Exchange is done. */
-                    printf("[OSPF PID%u] [EXCHANGE] Master: Exchange complete with %s.\n", pid, ip_to_string(remote_rid));
+                    printf("[PID %u] STATE | [EXCHANGE] Master: Exchange complete with %s.\n", pid, ip_to_string(remote_rid));
                     ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
                 }
              }
@@ -1221,7 +1214,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
                 bool we_have_more = false; /* Simplified */
 
                 if (!(flags & OSPF_DD_FLAG_M) && !we_have_more) {
-                    printf("[OSPF PID%u] [EXCHANGE] Slave: Exchange complete with %s.\n", pid, ip_to_string(remote_rid));
+                    printf("[PID %u] STATE | [EXCHANGE] Slave: Exchange complete with %s.\n", pid, ip_to_string(remote_rid));
                     ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
                 }
                 /* Acknowledge and send our next DD packet (which is empty in our simple case) */
@@ -1252,8 +1245,11 @@ int ospf_handle_lsr_packet(struct ethernet_hdr *eth_hdr,
     ospf_session_t *s,
     uint32_t src_ip)
 {
-  uint32_t remote_rid = hdr->router_id;  /* Should be 1.1.1.1 */
+  uint32_t remote_rid = hdr->router_id;
   uint32_t ls_type = ntohl(lsr->ls_type);
+  uint32_t lsid = lsr->link_state_id;
+  uint32_t adv_rtr = lsr->advertising_router;
+
 
   /* Determine interface */
   uint8_t iface_index = 0;
@@ -1266,11 +1262,10 @@ int ospf_handle_lsr_packet(struct ethernet_hdr *eth_hdr,
     }
   }
 
-  printf("[OSPF PID%u] <<< RECEIVED: LSR from FRR (1.1.1.1) type %u on interface %u\n",
-      pid, ls_type, iface_index);
+  printf("[PID %u] RECV  | LSR from %s for LSA (Type: %u, LSID: %s, AdvRtr: %s)\n",
+      pid, ip_to_string(remote_rid), ls_type, ip_to_string(lsid), ip_to_string(adv_rtr));
 
   /* Send LSU response immediately */
-  printf("[OSPF PID%u] Sending LSU response immediately\n", pid);
   uint8_t lsa_buf[OSPF_MAX_LSA_SIZE];
   struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
   ospf_generate_router_lsa(s, lsa, iface_index);
@@ -1301,8 +1296,7 @@ int ospf_handle_lsu_packet(struct ethernet_hdr *eth_hdr,
     }
   }
 
-  printf("[OSPF PID%u] <<< RECEIVED: LSU from FRR (1.1.1.1) with %u LSA(s) on interface %u\n",
-      pid, num, iface_index);
+  printf("[PID %u] RECV  | LSU from %s with %u LSA(s)\n", pid, ip_to_string(remote_rid), num);
 
   struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(lsu + 1);
   struct ospf_lsa_header *lsas_to_ack[OSPF_MAX_LSAS_PER_UPDATE];
@@ -1315,12 +1309,12 @@ int ospf_handle_lsu_packet(struct ethernet_hdr *eth_hdr,
     /* Add to LSDB */
     void *existing_data;
     if (rte_hash_lookup_data(s->lsdb, &key, &existing_data) < 0) {
+        char lsid_str[16], adv_str[16];
+        snprintf(lsid_str, sizeof(lsid_str), "%s", ip_to_string(lsa->link_state_id));
+        snprintf(adv_str, sizeof(adv_str), "%s", ip_to_string(lsa->advertising_router));
+        printf("[PID %u] INFO  | LSDB ADD: Type %u, LSID %s, AdvRtr %s, Seq 0x%x\n",
+            pid, lsa->type, lsid_str, adv_str, ntohl(lsa->sequence_number));
       rte_hash_add_key_data(s->lsdb, &key, lsa);
-      char lsid_str[16], adv_str[16];
-      snprintf(lsid_str, sizeof(lsid_str), "%s", ip_to_string(lsa->link_state_id));
-      snprintf(adv_str, sizeof(adv_str), "%s", ip_to_string(lsa->advertising_router));
-      printf("[OSPF PID%u] LSDB add: type %u, LSID %s, Adv %s\n",
-          pid, lsa->type, lsid_str, adv_str);
     }
 
     /* Move to next LSA */
@@ -1328,7 +1322,6 @@ int ospf_handle_lsu_packet(struct ethernet_hdr *eth_hdr,
   }
 
   /* Send LSAck immediately */
-  printf("[OSPF PID%u] Sending LSAck immediately\n", pid);
   ospf_send_lsack_packet(pid, s, remote_rid, lsas_to_ack, lsa_count, iface_index);
 
   /* Move to FULL state */
@@ -1336,7 +1329,6 @@ int ospf_handle_lsu_packet(struct ethernet_hdr *eth_hdr,
     if (s->neighbors[i].router_id == remote_rid &&
         s->neighbors[i].interface_index == iface_index &&
         s->neighbors[i].state == OSPF_STATE_LOADING) {
-      printf("[OSPF PID%u] Moving to FULL state with FRR\n", pid);
       ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_FULL);
       break;
     }
@@ -1352,42 +1344,11 @@ int ospf_handle_lsack_packet(struct ethernet_hdr *eth_hdr,
     uint32_t src_ip)
 {
     uint32_t remote_rid = hdr->router_id;
-
-    /* Determine interface */
-    uint8_t iface_index = 0;
-    for (int i = 0; i < s->interface_count; i++) {
-        uint32_t network = s->interfaces[i].ip_address & s->interfaces[i].network_mask;
-        uint32_t src_network = src_ip & s->interfaces[i].network_mask;
-        if (network == src_network) {
-            iface_index = i;
-            break;
-        }
-    }
-
-    printf("[OSPF PID%u] <<< RECEIVED: LSAck from FRR (%s) on interface %u\n",
-           pid, ip_to_string(remote_rid), iface_index);
-
-    struct ospf_lsa_header *lsa_hdr = (struct ospf_lsa_header *)(hdr + 1);
     uint16_t ospf_len = ntohs(hdr->length);
     uint16_t headers_len = ospf_len - sizeof(struct ospf_header);
-
-    if (headers_len % sizeof(struct ospf_lsa_header) != 0) {
-        printf("[OSPF PID%u] LSAck packet has invalid length\n", pid);
-        return -1;
-    }
     int num_lsas = headers_len / sizeof(struct ospf_lsa_header);
 
-    printf("[OSPF PID%u] LSAck contains %d LSA header(s):\n", pid, num_lsas);
-
-    for (int i = 0; i < num_lsas; i++) {
-        char lsid_str[16], adv_str[16];
-        snprintf(lsid_str, sizeof(lsid_str), "%s", ip_to_string(lsa_hdr[i].link_state_id));
-        snprintf(adv_str, sizeof(adv_str), "%s", ip_to_string(lsa_hdr[i].advertising_router));
-
-        printf("  - Type: %u, LSID: %s, AdvRtr: %s, Seq: 0x%x\n",
-               lsa_hdr[i].type, lsid_str, adv_str,
-               ntohl(lsa_hdr[i].sequence_number));
-    }
+    printf("[PID %u] RECV  | LSAck from %s (%d LSAs)\n", pid, ip_to_string(remote_rid), num_lsas);
 
     /* In a full implementation, we would use this info to stop retransmitting these LSAs. */
     /* For this simulator, logging is sufficient to confirm the exchange is happening. */
@@ -1808,26 +1769,47 @@ void ospf_display_stats(uint8_t pid) {
     if (pid >= RTE_MAX_ETHPORTS) return;
 
     ospf_session_t *s = &ospf_sessions[pid];
-    printf("\n--- OSPF Stats for PID %u ---\n", pid);
     char rid_str[16];
     snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(s->router_id));
-    printf("Router ID: %s\n", rid_str);
-    printf("Neighbors:\n");
-    for (int i = 0; i < s->neighbor_count; i++) {
-        ospf_neighbor_t *n = &s->neighbors[i];
-        char n_rid_str[16];
-        snprintf(n_rid_str, sizeof(n_rid_str), "%s", ip_to_string(n->router_id));
-        printf("  - %s: %s\n", n_rid_str, ospf_state_to_string(n->state));
+
+    printf("\n"
+           "┌────────────────────────── OSPF STATS (PID %u) ──────────────────────────┐\n"
+           "│ Router ID: %-48s │\n",
+           pid, rid_str);
+
+    if (s->neighbor_count > 0) {
+        printf("├────────────────────────────── Neighbors ───────────────────────────────┤\n");
+        for (int i = 0; i < s->neighbor_count; i++) {
+            ospf_neighbor_t *n = &s->neighbors[i];
+            char n_rid_str[16];
+            snprintf(n_rid_str, sizeof(n_rid_str), "%s", ip_to_string(n->router_id));
+            printf("│ %-18s | State: %-12s | Master: %-3s | Seq: %-12u │\n",
+                   n_rid_str,
+                   ospf_state_to_string(n->state),
+                   n->is_master ? "Yes" : "No",
+                   n->dd_sequence);
+        }
+    } else {
+        printf("├────────────────────────────── Neighbors ───────────────────────────────┤\n"
+               "│ No neighbors established.                                            │\n");
     }
-    printf("Packet Stats (TX/RX):\n");
-    printf("  Hello: %lu/%lu\n", s->config.hello_sent, s->config.hello_received);
-    printf("  DD:    %lu/%lu\n", s->config.dd_sent, s->config.dd_received);
-    printf("  LSR:   %lu/%lu\n", s->config.lsr_sent, s->config.lsr_received);
-    printf("  LSU:   %lu/%lu\n", s->config.lsu_sent, s->config.lsu_received);
-    printf("  LSAck: %lu/%lu\n", s->config.lsack_sent, s->config.lsack_received);
-    printf("DB Counts:\n");
-    printf("  LSDB: %d\n", rte_hash_count(s->lsdb));
-    printf("  RIB:  %d\n", rte_hash_count(s->rib));
-    printf("  FIB:  %d\n", rte_hash_count(s->fib));
-    printf("-------------------------\n");
+
+    printf("├────────────────────────── Packet Stats (TX/RX) ────────────────────────┤\n"
+           "│ Hello: %-12lu / %-12lu | DD:    %-12lu / %-12lu │\n"
+           "│ LSR:   %-12lu / %-12lu | LSU:   %-12lu / %-12lu │\n"
+           "│ LSAck: %-12lu / %-12lu | Total: %-12lu / %-12lu │\n",
+           s->config.hello_sent, s->config.hello_received,
+           s->config.dd_sent, s->config.dd_received,
+           s->config.lsr_sent, s->config.lsr_received,
+           s->config.lsu_sent, s->config.lsu_received,
+           s->config.lsack_sent, s->config.lsack_received,
+           s->config.hello_sent + s->config.dd_sent + s->config.lsr_sent + s->config.lsu_sent + s->config.lsack_sent,
+           s->config.hello_received + s->config.dd_received + s->config.lsr_received + s->config.lsu_received + s->config.lsack_received);
+
+    printf("├─────────────────────────── DB Counts ────────────────────────────┤\n"
+           "│ LSDB: %-15d | RIB: %-15d | FIB: %-15d │\n"
+           "└──────────────────────────────────────────────────────────────────────┘\n",
+           rte_hash_count(s->lsdb),
+           rte_hash_count(s->rib),
+           rte_hash_count(s->fib));
 }

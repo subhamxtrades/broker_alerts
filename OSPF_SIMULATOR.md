@@ -234,3 +234,23 @@ This section details the step-by-step packet exchange that occurs between the DP
 4.  **Adjacency Formed (Full)**
     *   Once both routers have received and acknowledged all necessary LSAs, the neighbor state transitions to `FULL`.
     *   The routers now periodically exchange **Hello** packets to maintain the adjacency.
+
+## 6. Known Deviations from RFC 2328
+
+This implementation contains specific behaviors that deviate from the OSPFv2 standard as defined in RFC 2328. These changes were implemented to meet the specific requirements of the target simulation environment and ensure interoperability with a particular FRR configuration.
+
+### 1. Destination Address for DD, LSR, LSU, and LSAck Packets
+
+*   **RFC Standard**: On Point-to-Point networks, after the `Init` state, all OSPF protocol packets (including DD, LSR, LSU, and LSAck) should be sent via **unicast** directly to the neighbor's IP address.
+*   **Simulator Implementation**: In this simulator, all OSPF packets, including DD, LSR, LSU, and LSAck, are sent to the **multicast** address `224.0.0.5` (`AllSPFRouters`).
+
+    *   **Reason**: This change was explicitly requested and is necessary for interoperability with the user's FRR environment, which, based on logs and packet captures, also appears to send these packet types to the multicast address in this specific P2P setup.
+
+### 2. Interface MTU in Database Description (DD) Packets
+
+*   **RFC Standard**: For Point-to-Point interfaces, the Interface MTU field in the DD packet body should be set to **0** (zero).
+*   **Simulator Implementation**: The MTU field is set to **1500**.
+
+    *   **Reason**: This was an explicit requirement for the simulation scenario. Setting the MTU to a non-zero value was necessary to match the behavior observed in the target environment's packet captures.
+
+These deviations are critical for the simulator to function correctly in its intended environment but may cause interoperability issues with other strictly RFC-compliant OSPF implementations.
