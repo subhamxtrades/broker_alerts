@@ -794,7 +794,7 @@ void ospf_update_neighbor_state(ospf_session_t *s,
         s->neighbors[i].initial_dd_sent = 0;
         s->neighbors[i].dd_sequence = (rte_rand() & 0xffffff);
     }
-
+      char rid_str[16];
       snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(neighbor_rid));
       printf("[PID %u] STATE | Neighbor %-15s | %s -> %s\n",
           s->pid,
