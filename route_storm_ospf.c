@@ -180,7 +180,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
   if (router_id == 0) {
     switch (pid) {
       case 0: s->router_id = string_to_ip("2.2.2.2"); break;    /* Your router PID 0 */
-      case 1: s->router_id = string_to_ip("3.3.3.3"); break;    /* Your router PID 1 */
+      case 1: s->router_id = string_to_ip("2.2.2.2"); break;    /* Your router PID 1 */
       default: s->router_id = string_to_ip("192.168.99.100"); break;
     }
   } else {
@@ -194,7 +194,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
   s->config.area_id   = s->area_id;
   s->config.hello_interval = OSPF_HELLO_INTERVAL;
   s->config.dead_interval  = OSPF_DEAD_INTERVAL;
-  s->config.priority = 0;  /* Priority 0 for point-to-point (no DR election) */
+  s->config.priority = 1;
   s->config.options  = OSPF_OPTION_E;
   s->config.network_mask = string_to_ip("255.255.255.0");
   s->config.designated_router = 0;
@@ -213,7 +213,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
     iface->type = OSPF_IFTYPE_P2P;  /* FIXED: POINT-TO-POINT */
     iface->hello_interval = OSPF_HELLO_INTERVAL;
     iface->dead_interval  = OSPF_DEAD_INTERVAL;
-    iface->priority = 0;  /* Priority 0 for point-to-point */
+    iface->priority = 1;
     iface->options  = OSPF_OPTION_E;
     iface->cost = 10;
     iface->state = 1;  /* up */
@@ -231,7 +231,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
     iface->type = OSPF_IFTYPE_P2P;  /* FIXED: POINT-TO-POINT */
     iface->hello_interval = OSPF_HELLO_INTERVAL;
     iface->dead_interval  = OSPF_DEAD_INTERVAL;
-    iface->priority = 0;  /* Priority 0 for point-to-point */
+    iface->priority = 1;
     iface->options  = OSPF_OPTION_E;
     iface->cost = 10;
     iface->state = 1;  /* up */
@@ -521,12 +521,7 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
   struct ospf_dd *dd = (struct ospf_dd *)buf;
   memset(dd, 0, total_len);
 
-  /* IMPORTANT: Set MTU to 0 for point-to-point links (RFC 2328) */
-  if (iface->type == OSPF_IFTYPE_P2P) {
-    dd->mtu = htons(0);  /* MTU=0 for P2P links */
-  } else {
-    dd->mtu = htons(OSPF_DEFAULT_MTU);
-  }
+  dd->mtu = htons(1500);
 
   dd->options = s->config.options;
 
@@ -1225,6 +1220,22 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
             return -1;
         }
 
+        if (has_lsa_headers) {
+            struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(dd + 1);
+            uint16_t ospf_len = ntohs(hdr->length);
+            uint16_t remaining_len = ospf_len - sizeof(struct ospf_header) - sizeof(struct ospf_dd);
+
+            while (remaining_len >= sizeof(struct ospf_lsa_header)) {
+                if (nbr->ls_request_count < OSPF_MAX_LSAS_PER_UPDATE) {
+                    memcpy(&nbr->ls_request_list[nbr->ls_request_count], lsa, sizeof(struct ospf_lsa_header));
+                    nbr->ls_request_count++;
+                }
+                uint16_t lsa_len = ntohs(lsa->length);
+                remaining_len -= lsa_len;
+                lsa = (struct ospf_lsa_header *)((uint8_t *)lsa + lsa_len);
+            }
+        }
+
         if (nbr->is_master) {
              if (dd_seq == nbr->dd_sequence) {
                 /* Slave acknowledged our last DD packet. We can send the next one. */
@@ -1551,7 +1562,7 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
       router_id = string_to_ip("2.2.2.2");  /* Your router RID for PID 0 */
       break;
     case 1:
-      router_id = string_to_ip("3.3.3.3");  /* Your router RID for PID 1 */
+      router_id = string_to_ip("2.2.2.2");  /* Your router RID for PID 1 */
       break;
     default:
       router_id = string_to_ip("192.168.99.99");
@@ -1640,6 +1651,19 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
             ospf_send_dd_packet(pid, s, n->router_id, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_sequence, false, n->interface_index);
             n->last_dd_sent = rte_get_tsc_cycles();
             n->initial_dd_sent = 1;
+        }
+    }
+
+    /* Check for neighbors in LOADING state to send LSRs */
+    for (int i = 0; i < s->neighbor_count; i++) {
+        ospf_neighbor_t *n = &s->neighbors[i];
+        if (n->state == OSPF_STATE_LOADING && n->ls_request_count > 0) {
+            printf("[OSPF PID%u] Neighbor %s is LOADING, sending LSRs.\n", pid, ip_to_string(n->router_id));
+            for (int j = 0; j < n->ls_request_count; j++) {
+                struct ospf_lsa_header *lsa_h = &n->ls_request_list[j];
+                ospf_send_lsr_packet(pid, s, n->router_id, lsa_h->type, lsa_h->link_state_id, lsa_h->advertising_router, n->interface_index);
+            }
+            n->ls_request_count = 0; /* Clear the request list */
         }
     }
 

@@ -220,8 +220,8 @@ typedef struct {
     uint64_t last_lsr_received;    /* TSC cycles */
     uint64_t last_lsu_received;    /* TSC cycles */
     uint64_t creation_time;        /* TSC cycles */
-    uint32_t lsdb_summary[16];     /* Track LSAs exchanged */
-    uint8_t  lsdb_summary_count;
+    struct ospf_lsa_header ls_request_list[OSPF_MAX_LSAS_PER_UPDATE];
+    uint8_t ls_request_count;
     ospf_exchange_state_t exchange_state;
 } ospf_neighbor_t;
 
