@@ -180,7 +180,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
   if (router_id == 0) {
     switch (pid) {
       case 0: s->router_id = string_to_ip("2.2.2.2"); break;    /* Your router PID 0 */
-      case 1: s->router_id = string_to_ip("2.2.2.2"); break;    /* Your router PID 1 */
+      case 1: s->router_id = string_to_ip("3.3.3.3"); break;    /* Your router PID 1 */
       default: s->router_id = string_to_ip("192.168.99.100"); break;
     }
   } else {
@@ -521,7 +521,12 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
   struct ospf_dd *dd = (struct ospf_dd *)buf;
   memset(dd, 0, total_len);
 
-  dd->mtu = htons(1500);
+  /* IMPORTANT: Set MTU to 0 for point-to-point links (RFC 2328) */
+  if (iface->type == OSPF_IFTYPE_P2P) {
+    dd->mtu = htons(0);  /* MTU=0 for P2P links */
+  } else {
+    dd->mtu = htons(OSPF_DEFAULT_MTU);
+  }
 
   dd->options = s->config.options;
 
@@ -1562,7 +1567,7 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
       router_id = string_to_ip("2.2.2.2");  /* Your router RID for PID 0 */
       break;
     case 1:
-      router_id = string_to_ip("2.2.2.2");  /* Your router RID for PID 1 */
+      router_id = string_to_ip("3.3.3.3");  /* Your router RID for PID 1 */
       break;
     default:
       router_id = string_to_ip("192.168.99.99");
