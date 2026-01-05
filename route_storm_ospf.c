@@ -207,7 +207,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
     /* PID 0: Interface connected to FRR port 1 (192.168.1.1) */
     ospf_interface_t *iface = &s->interfaces[0];
     memset(iface, 0, sizeof(*iface));
-    iface->ip_address = string_to_ip("192.168.1.100");
+    iface->ip_address = string_to_ip("192.168.1.2");
     iface->network_mask = s->config.network_mask;
     iface->area_id = s->area_id;
     iface->type = OSPF_IFTYPE_P2P;  /* FIXED: POINT-TO-POINT */
@@ -225,7 +225,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
     /* PID 1: Interface connected to FRR port 2 (192.168.2.1) */
     ospf_interface_t *iface = &s->interfaces[0];
     memset(iface, 0, sizeof(*iface));
-    iface->ip_address = string_to_ip("192.168.2.100");
+    iface->ip_address = string_to_ip("192.168.2.2");
     iface->network_mask = s->config.network_mask;
     iface->area_id = s->area_id;
     iface->type = OSPF_IFTYPE_P2P;  /* FIXED: POINT-TO-POINT */
@@ -521,12 +521,7 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
   struct ospf_dd *dd = (struct ospf_dd *)buf;
   memset(dd, 0, total_len);
 
-  /* IMPORTANT: Set MTU to 0 for point-to-point links (RFC 2328) */
-  if (iface->type == OSPF_IFTYPE_P2P) {
-    dd->mtu = htons(0);  /* MTU=0 for P2P links */
-  } else {
-    dd->mtu = htons(OSPF_DEFAULT_MTU);
-  }
+  dd->mtu = htons(1500);
 
   dd->options = s->config.options;
 
@@ -559,7 +554,7 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
     free(buf);
     return -1;
   }
-  uint32_t dst_ip = neighbor->ip_address;
+  uint32_t dst_ip = string_to_ip(OSPF_ALLSPFROUTERS_MCAST);
 
   /* Store IP strings in local buffers to avoid undefined behavior with ip_to_string */
   char rid_str[16], dst_str[16], iface_str[16];
@@ -597,20 +592,7 @@ int ospf_send_lsr_packet(uint8_t pid, ospf_session_t *s,
   lsr.link_state_id     = link_state_id;     /* already net order */
   lsr.advertising_router = adv_router;      /* net order */
 
-  /* Unicast LSR packets to the neighbor */
-  ospf_neighbor_t *neighbor = NULL;
-  for (int i = 0; i < s->neighbor_count; i++) {
-    if (s->neighbors[i].router_id == neighbor_rid && s->neighbors[i].interface_index == iface_index) {
-      neighbor = &s->neighbors[i];
-      break;
-    }
-  }
-
-  if (!neighbor) {
-    printf("[OSPF PID%u] ERROR: Cannot send LSR to unknown neighbor %s\n", pid, ip_to_string(neighbor_rid));
-    return -1;
-  }
-  uint32_t dst_ip = neighbor->ip_address;
+  uint32_t dst_ip = string_to_ip(OSPF_ALLSPFROUTERS_MCAST);
 
   /* Store IP strings in local buffers to avoid undefined behavior */
   char rid_str[16], dst_str[16], iface_str[16];
@@ -747,21 +729,7 @@ int ospf_send_lsu_packet(uint8_t pid, ospf_session_t *s,
     }
   }
 
-  /* Unicast LSU packets to the neighbor */
-  ospf_neighbor_t *neighbor = NULL;
-  for (int i = 0; i < s->neighbor_count; i++) {
-    if (s->neighbors[i].router_id == neighbor_rid && s->neighbors[i].interface_index == iface_index) {
-      neighbor = &s->neighbors[i];
-      break;
-    }
-  }
-
-  if (!neighbor) {
-    printf("[OSPF PID%u] ERROR: Cannot send LSU to unknown neighbor %s\n", pid, ip_to_string(neighbor_rid));
-    free(buf);
-    return -1;
-  }
-  uint32_t dst_ip = neighbor->ip_address;
+  uint32_t dst_ip = string_to_ip(OSPF_ALLSPFROUTERS_MCAST);
 
   /* Store IP strings in local buffers to avoid undefined behavior */
   char rid_str[16], dst_str[16], iface_str[16];
@@ -792,20 +760,7 @@ int ospf_send_lsack_packet(uint8_t pid, ospf_session_t *s,
         memcpy(buf + (i * sizeof(struct ospf_lsa_header)), lsas[i], sizeof(struct ospf_lsa_header));
     }
 
-    ospf_neighbor_t *neighbor = NULL;
-    for (int i = 0; i < s->neighbor_count; i++) {
-        if (s->neighbors[i].router_id == neighbor_rid && s->neighbors[i].interface_index == iface_index) {
-            neighbor = &s->neighbors[i];
-            break;
-        }
-    }
-
-    if (!neighbor) {
-        printf("[OSPF PID%u] ERROR: Cannot send LSAck to unknown neighbor %s\n", pid, ip_to_string(neighbor_rid));
-        free(buf);
-        return -1;
-    }
-    uint32_t dst_ip = neighbor->ip_address;
+    uint32_t dst_ip = string_to_ip(OSPF_ALLSPFROUTERS_MCAST);
 
     printf("[OSPF PID%u] Sending LSAck to %s for %u LSAs\n", pid, ip_to_string(neighbor_rid), lsa_count);
 
