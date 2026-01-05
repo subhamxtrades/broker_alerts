@@ -1159,6 +1159,7 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
              printf("[PID %u] WARN  | [EXSTART] Mastership conflict with %s. Re-asserting master role.\n",
                     pid, ip_to_string(remote_rid));
              ospf_send_dd_packet(pid, s, nbr->router_id, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, false, nbr->interface_index);
+             nbr->last_dd_sent = rte_get_tsc_cycles(); /* Reset retransmission timer */
         }
         break;
 
