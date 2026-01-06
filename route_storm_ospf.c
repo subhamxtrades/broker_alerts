@@ -1220,16 +1220,18 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
         if (has_lsa_headers) {
             struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(dd + 1);
             uint16_t ospf_len = ntohs(hdr->length);
-            uint16_t remaining_len = ospf_len - sizeof(struct ospf_header) - sizeof(struct ospf_dd);
+            uint16_t headers_section_len = ospf_len - sizeof(struct ospf_header) - sizeof(struct ospf_dd);
+            int num_lsa_headers = headers_section_len / sizeof(struct ospf_lsa_header);
 
-            while (remaining_len >= sizeof(struct ospf_lsa_header)) {
+            printf("[PID %u] INFO  | DD packet contains %d LSA headers.\n", pid, num_lsa_headers);
+
+            for (int i = 0; i < num_lsa_headers; i++) {
                 if (nbr->ls_request_count < OSPF_MAX_LSAS_PER_UPDATE) {
                     memcpy(&nbr->ls_request_list[nbr->ls_request_count], lsa, sizeof(struct ospf_lsa_header));
                     nbr->ls_request_count++;
                 }
-                uint16_t lsa_len = ntohs(lsa->length);
-                remaining_len -= lsa_len;
-                lsa = (struct ospf_lsa_header *)((uint8_t *)lsa + lsa_len);
+                /* Advance pointer by the size of the LSA header, not the full LSA length */
+                lsa = (struct ospf_lsa_header *)((uint8_t *)lsa + sizeof(struct ospf_lsa_header));
             }
         }
 
