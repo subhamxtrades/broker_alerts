@@ -115,16 +115,16 @@ This configuration assumes the following network topology:
 *   **Link 1**:
     *   The FRR router's `ens37` interface is connected to the same Layer 2 network as DPDK **Port 0**.
     *   FRR `ens37` IP: `192.168.1.1/24`.
-    *   DPDK Port 0 IP: `192.168.1.100/24` (Router ID: `2.2.2.2`).
+    *   DPDK Port 0 IP: `192.168.1.2/24` (Router ID: `2.2.2.2`).
 *   **Link 2**:
     *   The FRR router's `ens38` interface is connected to the same Layer 2 network as DPDK **Port 1**.
     *   FRR `ens38` IP: `192.168.2.1/24`.
-    *   DPDK Port 1 IP: `192.168.2.100/24` (Router ID: `3.3.3.3`).
+    *   DPDK Port 1 IP: `192.168.2.2/24` (Router ID: `3.3.3.3`).
 *   The FRR router itself has a Router ID of `1.1.1.1`.
 
 ### FRR Configuration
 
-The following configuration can be applied to FRR using its integrated shell, `vtysh`. This is based on the running configuration provided by the user.
+The following configuration can be applied to FRR using its integrated shell, `vtysh`.
 
 ```shell
 # Enter configuration mode
@@ -171,8 +171,8 @@ Once configured, you can verify the OSPF adjacencies on the FRR router using the
 
     ```
     Neighbor ID     Pri   State           Dead Time   Address         Interface                        RXmtL RtrdQL
-    2.2.2.2         1     Full/ -         00:00:35    192.168.1.100   ens37:192.168.1.1                  0     0
-    3.3.3.3         1     Full/ -         00:00:38    192.168.2.100   ens38:192.168.2.1                  0     0
+    2.2.2.2         1     Full/ -         00:00:35    192.168.1.2     ens37:192.168.1.1                  0     0
+    3.3.3.3         1     Full/ -         00:00:38    192.168.2.2     ens38:192.168.2.1                  0     0
     ```
 
 *   **Check the OSPF interfaces**:
@@ -184,7 +184,7 @@ Once configured, you can verify the OSPF adjacencies on the FRR router using the
 
 ## 5. Typical Packet Exchange Flow (DPDK <-> FRR)
 
-This section details the step-by-step packet exchange that occurs between the DPDK simulator and an FRR router during a successful adjacency formation. The same process occurs concurrently on both links.
+This section details the step-by-step packet exchange that occurs between the DPDK simulator and an FRR router during a successful adjacency formation.
 
 **Assumptions (for Link 1):**
 *   DPDK Simulator (Port 0) Router ID: `2.2.2.2`
@@ -204,53 +204,33 @@ This section details the step-by-step packet exchange that occurs between the DP
 
 2.  **Database Synchronization (ExStart -> Exchange)**
     *   *Both routers transition to `EXSTART` state after reaching `2-WAY`.*
-    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X, Flags: I=1, M=1, MS=1, Body: empty)
+    *   `DPDK -> Multicast`: **DD Packet** (Seq=X, Flags: I=1, M=1, MS=1, Body: empty)
         *   *DPDK (MASTER, higher Router ID) asserts its mastership and proposes initial sequence number X.*
-    *   *FRR (SLAVE, lower Router ID) may also send a similar packet, but it will eventually see and accept DPDK's packet due to the lower Router ID.*
-    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X, Flags: I=0, M=1, MS=0, Body: empty)
-        *   *FRR (now SLAVE) acknowledges DPDK's mastership by clearing the `I` and `MS` bits and echoing sequence number X. This packet is also empty.*
-    *   *Upon sending this, FRR moves to `EXCHANGE`. Upon receiving this, DPDK also moves to `EXCHANGE`. The negotiation is complete.*
+    *   `FRR -> Multicast`: **DD Packet** (Seq=X, Flags: I=0, M=1, MS=0, Body: empty)
+        *   *FRR (now SLAVE) acknowledges DPDK's mastership by clearing the `I` and `MS` bits and echoing sequence number X.*
+    *   *Upon sending this, FRR moves to `EXCHANGE`. Upon receiving this, DPDK also moves to `EXCHANGE`.*
     *   --- *`EXCHANGE` State Begins* ---
-    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=1, Body: LSA Headers)
-        *   *DPDK (MASTER) sends the first packet containing LSA headers, incrementing the sequence number.*
-    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=X+1, Flags: M=1, MS=0, Body: LSA Headers)
+    *   `DPDK -> Multicast`: **DD Packet** (Seq=X+1, Flags: M=1, MS=1, Body: LSA Headers)
+        *   *DPDK (MASTER) sends the first packet containing LSA headers.*
+    *   `FRR -> Multicast`: **DD Packet** (Seq=X+1, Flags: M=1, MS=0, Body: LSA Headers)
         *   *FRR (SLAVE) acknowledges by echoing sequence number X+1 and sends its own LSA headers.*
     *   *...This poll-response continues until all LSA headers are exchanged...*
-    *   `DPDK -> FRR (Unicast)`: **DD Packet** (Seq=Z, Flags: M=0, MS=1, Body: Final LSA Headers)
-        *   *DPDK sends its final DD packet, clearing the `M` (More) bit.*
-    *   `FRR -> DPDK (Unicast)`: **DD Packet** (Seq=Z, Flags: M=0, MS=0, Body: Final LSA Headers)
-        *   *FRR acknowledges the final packet and sends its own final packet (clearing the `M` bit).*
-    *   *Once both routers have acknowledged each other's final DD packets, they move to the `LOADING` state.*
 
 3.  **LSA Exchange (Loading -> Full)**
-    *   `DPDK -> FRR (Unicast)`: **LSR Packet**
-        *   *DPDK requests the full LSA for any database entries learned from FRR in the `Exchange` phase.*
-    *   `FRR -> DPDK (Unicast)`: **LSU Packet**
-        *   *FRR responds with the requested LSA(s) in an LSU packet.*
-    *   `DPDK -> FRR (Unicast)`: **LSAck Packet**
-        *   *DPDK sends an acknowledgment for the received LSU.*
-    *   *(This LSR/LSU/LSAck exchange also happens in the other direction, with FRR requesting LSAs from DPDK).*
+    *   `DPDK -> Multicast`: **LSR Packet**
+    *   `FRR -> Multicast`: **LSU Packet**
+    *   `DPDK -> Multicast`: **LSAck Packet**
 
 4.  **Adjacency Formed (Full)**
     *   Once both routers have received and acknowledged all necessary LSAs, the neighbor state transitions to `FULL`.
-    *   The routers now periodically exchange **Hello** packets to maintain the adjacency.
 
 ## 6. Known Deviations from RFC 2328
 
-This implementation contains specific behaviors that deviate from the OSPFv2 standard as defined in RFC 2328. These changes were implemented to meet the specific requirements of the target simulation environment and ensure interoperability with a particular FRR configuration.
+This implementation contains specific behaviors that deviate from the OSPFv2 standard as defined in RFC 2328. These changes were implemented to meet the specific requirements of the target simulation environment.
 
-### 1. Destination Address for DD, LSR, LSU, and LSAck Packets
+### 1. Destination Address for All OSPF Packets
 
-*   **RFC Standard**: On Point-to-Point networks, after the `Init` state, all OSPF protocol packets (including DD, LSR, LSU, and LSAck) should be sent via **unicast** directly to the neighbor's IP address.
-*   **Simulator Implementation**: In this simulator, all OSPF packets, including DD, LSR, LSU, and LSAck, are sent to the **multicast** address `224.0.0.5` (`AllSPFRouters`).
+*   **RFC Standard**: On Point-to-Point networks, only Hello packets are sent to the multicast address `224.0.0.5`. After the `Init` state, all subsequent OSPF packets (DD, LSR, LSU, LSAck) should be sent via **unicast** to the neighbor's IP address.
+*   **Simulator Implementation**: In this simulator, **all** OSPF packets, including DD, LSR, LSU, and LSAck, are sent to the **multicast** address `224.0.0.5`.
 
-    *   **Reason**: This change was explicitly requested and is necessary for interoperability with the user's FRR environment, which, based on logs and packet captures, also appears to send these packet types to the multicast address in this specific P2P setup.
-
-### 2. Interface MTU in Database Description (DD) Packets
-
-*   **RFC Standard**: For Point-to-Point interfaces, the Interface MTU field in the DD packet body should be set to **0** (zero).
-*   **Simulator Implementation**: The MTU field is set to **1500**.
-
-    *   **Reason**: This was an explicit requirement for the simulation scenario. Setting the MTU to a non-zero value was necessary to match the behavior observed in the target environment's packet captures.
-
-These deviations are critical for the simulator to function correctly in its intended environment but may cause interoperability issues with other strictly RFC-compliant OSPF implementations.
+    *   **Reason**: This change was explicitly required to ensure interoperability with the user's target FRR environment, which appears to expect this behavior in the specific P2P setup.
