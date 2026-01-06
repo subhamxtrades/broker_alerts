@@ -179,7 +179,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
   /* Set Router IDs based on your topology */
   if (router_id == 0) {
     switch (pid) {
-      case 0: s->router_id = string_to_ip("2.2.2.2"); break;    /* Your router PID 0 */
+      case 0: s->router_id = string_to_ip("2.2.2.2"); break;    /* As per Wireshark */
       case 1: s->router_id = string_to_ip("3.3.3.3"); break;    /* Your router PID 1 */
       default: s->router_id = string_to_ip("192.168.99.100"); break;
     }
@@ -207,7 +207,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
     /* PID 0: Interface connected to FRR port 1 (192.168.1.1) */
     ospf_interface_t *iface = &s->interfaces[0];
     memset(iface, 0, sizeof(*iface));
-    iface->ip_address = string_to_ip("192.168.1.2");
+    iface->ip_address = string_to_ip("192.168.1.2"); /* As per Wireshark */
     iface->network_mask = s->config.network_mask;
     iface->area_id = s->area_id;
     iface->type = OSPF_IFTYPE_P2P;  /* FIXED: POINT-TO-POINT */
@@ -523,7 +523,7 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
   struct ospf_dd *dd = (struct ospf_dd *)buf;
   memset(dd, 0, total_len);
 
-  dd->mtu = htons(1500);
+  dd->mtu = htons(1500); /* As per Wireshark */
 
   dd->options = s->config.options;
 
