@@ -22,8 +22,8 @@ struct ethernet_hdr;
 #define OSPF_DEFAULT_MTU            1500
 #define OSPF_DEFAULT_AREA           0x00000000  /* 0.0.0.0 */
 
-#define OSPF_HELLO_INTERVAL         10
-#define OSPF_DEAD_INTERVAL          40
+#define OSPF_HELLO_INTERVAL         2
+#define OSPF_DEAD_INTERVAL          10
 #define OSPF_SESSION_TIMEOUT        60  /* seconds */
 
 #define OSPF_ALLSPFROUTERS_MCAST    "224.0.0.5"

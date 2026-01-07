@@ -44,8 +44,8 @@ Before the main loop begins, the simulator sets up the environment for a given D
 
 1.  **`ospf_initialize_test(pid, router_id, area_id)`**: This function is called to initialize the OSPF session.
     *   It first calls `ospf_cleanup_session` to clear any previous state.
-    *   It configures the `ospf_session_t` with the router's static properties, such as its **Router ID**, **Area ID**, and default Hello/Dead intervals.
-    *   It initializes the network interface (`ospf_interface_t`) as a **Point-to-Point** link with a hardcoded IP address.
+    *   It configures the `ospf_session_t` with the router's static properties, such as its **Router ID**, **Area ID**, and the new, more aggressive Hello/Dead intervals.
+    *   It initializes the network interface (`ospf_interface_t`) as a **Point-to-Point** link with a hardcoded IP address and a `/30` subnet mask.
     *   It creates the `rte_hash` tables that will serve as the **LSDB**, **RIB**, and **FIB**.
 
 2.  **Initial Hello Packet**: Immediately after initialization, the simulator sends its first **Hello packet** via `ospf_send_hello_packet`. This is a critical step to announce its presence on the network and begin the neighbor discovery process.
@@ -55,8 +55,8 @@ Before the main loop begins, the simulator sets up the environment for a given D
 The `while (pblast[pid].trafficStatus)` loop is the heart of the simulator. On each iteration, it performs the following tasks in sequence:
 
 1.  **Process Timers and Timeouts**:
-    *   **Hello Timer**: It checks if the `hello_interval` has passed since the last Hello was sent. If so, it calls `ospf_send_hello_packet` to maintain neighbor relationships.
-    *   **Neighbor Timeout**: It calls `ospf_process_neighbor_timeouts` to check if the `dead_interval` has expired for any neighbors. If a neighbor is declared dead, its state is set to `OSPF_STATE_DOWN`, and it is removed from the neighbor table.
+    *   **Preemptive Hello Timer**: It checks if 90% of the `hello_interval` (1.8 seconds) has passed since the last Hello was sent. If so, it calls `ospf_send_hello_packet` to proactively compensate for network and kernel delays.
+    *   **Neighbor Timeout**: It calls `ospf_process_neighbor_timeouts` to check if the `dead_interval` (plus a 500ms grace period) has expired for any neighbors.
 
 2.  **Receive and Process Packets**:
     *   `rte_eth_rx_burst` is called to poll the DPDK port for incoming packets.
@@ -78,53 +78,25 @@ The `ospf_process_packet` function is the entry point for all received OSPF traf
 
 ## 3. How it Works: The OSPF Adjacency Process
 
-The simulator follows the standard OSPFv2 state machine to establish an adjacency with a peer router. Because all interfaces are configured as **Point-to-Point**, the process is simplified and does not involve a DR/BDR election.
-
-1.  **Down State**: The initial state. The simulator begins sending Hello packets to the `AllSPFRouters` multicast address (`224.0.0.5`) to discover neighbors.
-
-2.  **Init State**: When the simulator receives a Hello packet from a new neighbor (e.g., an FRR router), it creates an `ospf_neighbor_t` entry for that neighbor and transitions its state to `INIT`. In this state, the simulator has heard from the neighbor, but two-way communication has not yet been established. The simulator continues to send Hellos, now including the Router ID of the newly discovered neighbor in the "Neighbors" list of its Hello packets.
-
-3.  **2-Way State**: When the simulator receives a Hello packet from a neighbor that contains the simulator's own Router ID in the "Neighbors" list, it confirms that communication is bidirectional. The state transitions to `2-WAY`.
-
-4.  **ExStart State**: For Point-to-Point links, the state machine immediately proceeds from `2-WAY` to `EXSTART`. In this state, the two routers negotiate the master/slave relationship and agree on an initial DD sequence number.
-    *   **Master/Slave Election**: The router with the **higher Router ID** becomes the **master**.
-    *   **Negotiation Process**: The master sends an empty DD packet with the `I` (Initial), `M` (More), and `MS` (Master/Slave) bits set. The slave acknowledges this by sending its own empty DD packet with the `MS` bit cleared, echoing the master's sequence number. Once this empty packet exchange is complete, the negotiation is done, and both routers transition to the `EXCHANGE` state.
-
-5.  **Exchange State**: Having established a master/slave relationship, the routers now exchange DD packets containing LSA headers to summarize their Link-State Databases (LSDBs).
-    *   The exchange follows a "poll-response" model. The master sends a DD packet with LSA headers and a new sequence number.
-    *   The slave acknowledges the master's packet by sending its own DD packet with the same sequence number, which contains its own LSA headers.
-    *   The `M` (More) bit is set in all but the final DD packet from each side. When a router has no more LSA headers to send, it clears the `M` bit in its last DD packet.
-    *   The `ospf_handle_dd_packet` function manages this entire state machine, ensuring RFC-compliant master/slave negotiation and LSA summary exchange.
-
-6.  **Loading State**: After the DD exchange is complete, each router knows which LSAs it is missing from its peer. The state transitions to `LOADING`.
-    *   The simulator sends **Link-State Request (LSR)** packets to request the full details of any missing or outdated LSAs.
-    *   The peer router responds with **Link-State Update (LSU)** packets, which contain the full LSA data.
-    *   The simulator acknowledges the receipt of the LSU with a **Link-State Acknowledgment (LSAck)** packet.
-    *   This process continues until all requested LSAs have been received.
-
-7.  **Full State**: Once the LSDBs of the two routers are fully synchronized, the neighbor state transitions to `FULL`. The adjacency is complete, and the routers can now include each other in their SPF (Shortest Path First) calculations.
+The simulator follows the standard OSPFv2 state machine to establish an adjacency with a peer router. Because all interfaces are configured as **Point-to-Point**, the process is simplified and does not involve a DR/BDR election. The state machine progresses from `DOWN` to `INIT`, `2-WAY`, `EXSTART`, `EXCHANGE`, `LOADING`, and finally `FULL`.
 
 ## 4. Sample FRR Configuration (Dual-Port)
 
-This section provides a sample configuration for an FRR router to establish OSPF adjacencies with a dual-port DPDK simulator setup.
+This section provides a sample configuration for an FRR router to establish OSPF adjacencies with the DPDK simulator, incorporating the new, more aggressive timing parameters.
 
 ### Assumptions
 
 This configuration assumes the following network topology:
 
 *   **Link 1**:
-    *   The FRR router's `ens37` interface is connected to the same Layer 2 network as DPDK **Port 0**.
-    *   FRR `ens37` IP: `192.168.1.1/24`.
-    *   DPDK Port 0 IP: `192.168.1.2/24` (Router ID: `2.2.2.2`).
+    *   FRR `ens37` IP: `192.168.1.1/30`.
+    *   DPDK Port 0 IP: `192.168.1.2/30` (Router ID: `2.2.2.2`).
 *   **Link 2**:
-    *   The FRR router's `ens38` interface is connected to the same Layer 2 network as DPDK **Port 1**.
-    *   FRR `ens38` IP: `192.168.2.1/24`.
-    *   DPDK Port 1 IP: `192.168.2.2/24` (Router ID: `3.3.3.3`).
+    *   FRR `ens38` IP: `192.168.2.1/30`.
+    *   DPDK Port 1 IP: `192.168.2.2/30` (Router ID: `2.2.2.2`).
 *   The FRR router itself has a Router ID of `1.1.1.1`.
 
 ### FRR Configuration
-
-The following configuration can be applied to FRR using its integrated shell, `vtysh`.
 
 ```shell
 # Enter configuration mode
@@ -132,105 +104,71 @@ configure terminal
 
 # --- Configure Interfaces ---
 interface ens37
- ip address 192.168.1.1/24
- ip ospf network point-to-point
+  ip address 192.168.1.1/30
+  ip ospf network point-to-point
+  ip ospf hello-interval 3
+  ip ospf dead-interval 12
+  ip ospf retransmit-interval 2
+  ip ospf mtu-ignore
+  ip ospf priority 1
 exit
 !
 interface ens38
- ip address 192.168.2.1/24
- ip ospf network point-to-point
+  ip address 192.168.2.1/30
+  ip ospf network point-to-point
+  ip ospf hello-interval 3
+  ip ospf dead-interval 12
+  ip ospf retransmit-interval 2
+  ip ospf mtu-ignore
+  ip ospf priority 1
 exit
 !
 
 # --- Configure OSPF Process ---
 router ospf
- # Set the OSPF Router ID for FRR
- ospf router-id 1.1.1.1
- # Announce the networks. This enables OSPF on the corresponding interfaces.
- network 192.168.1.0/24 area 0.0.0.0
- network 192.168.2.0/24 area 0.0.0.0
+  router-id 1.1.1.1
+  network 192.168.1.0/30 area 0
+  network 192.168.2.0/30 area 0
 exit
 !
 
 # Exit configuration mode
 end
-
-# (Optional) Save the configuration
-write
 ```
 
-### Verification
+## 5. Timing and Latency Compensation
 
-Once configured, you can verify the OSPF adjacencies on the FRR router using the following commands in `vtysh`:
+Analysis of packet captures revealed an asymmetric latency pattern between the DPDK simulator and the FRR router, primarily due to kernel processing delays on the FRR side. To ensure a stable OSPF adjacency, the simulator employs two key strategies:
 
-*   **Check neighbor status**:
-    ```shell
-    show ip ospf neighbor
-    ```
-    The output should show **two** neighbors: the simulator's Router IDs for both ports (`2.2.2.2` and `3.3.3.3`), both in the `FULL` state.
+### 1. Preemptive Hello Sending
 
-    ```
-    Neighbor ID     Pri   State           Dead Time   Address         Interface                        RXmtL RtrdQL
-    2.2.2.2         1     Full/ -         00:00:35    192.168.1.2     ens37:192.168.1.1                  0     0
-    3.3.3.3         1     Full/ -         00:00:38    192.168.2.2     ens38:192.168.2.1                  0     0
-    ```
+*   **Problem**: The ~1ms kernel delay on the FRR side can cause timer drift, making it seem as though the simulator's Hello packets are arriving late. Over time, this can lead to the OSPF dead timer expiring.
+*   **Solution**: The simulator sends Hello packets at 90% of the configured `hello_interval`. With a 2-second interval, this means sending a Hello every 1.8 seconds. This preemptive sending creates a buffer that absorbs the network and kernel latency, ensuring that FRR always receives a Hello packet well within the expected window.
 
-*   **Check the OSPF interfaces**:
-    ```shell
-    show ip ospf interface ens37
-    show ip ospf interface ens38
-    ```
-    These commands will show detailed information for each interface, confirming the network type is Point-to-Point and that a neighbor has been detected.
+### 2. Timeout Grace Period
 
-## 5. Typical Packet Exchange Flow (DPDK <-> FRR)
-
-This section details the step-by-step packet exchange that occurs between the DPDK simulator and an FRR router during a successful adjacency formation.
-
-**Assumptions (for Link 1):**
-*   DPDK Simulator (Port 0) Router ID: `2.2.2.2`
-*   FRR Router ID: `1.1.1.1`
-*   Based on the Router IDs, the **DPDK simulator will be the MASTER** for the DD exchange.
-
----
-
-1.  **Neighbor Discovery (Down -> 2-Way)**
-    *   `DPDK -> Multicast`: **Hello** (Neighbors list: empty)
-    *   `FRR -> Multicast`: **Hello** (Neighbors list: empty)
-        *   *DPDK receives this, adds FRR as a neighbor, and moves its state to `INIT`.*
-    *   `DPDK -> Multicast`: **Hello** (Neighbors list: `1.1.1.1`)
-        *   *FRR receives this, sees its own Router ID, and moves the neighbor state to `2-WAY`.*
-    *   `FRR -> Multicast`: **Hello** (Neighbors list: `2.2.2.2`)
-        *   *DPDK receives this, sees its own Router ID, and moves the neighbor state to `2-WAY`.*
-
-2.  **Database Synchronization (ExStart -> Exchange)**
-    *   *Both routers transition to `EXSTART` state after reaching `2-WAY`.*
-    *   `DPDK -> Multicast`: **DD Packet** (Seq=X, Flags: I=1, M=1, MS=1, Body: empty)
-        *   *DPDK (MASTER, higher Router ID) asserts its mastership and proposes initial sequence number X.*
-    *   `FRR -> Multicast`: **DD Packet** (Seq=X, Flags: I=0, M=1, MS=0, Body: empty)
-        *   *FRR (now SLAVE) acknowledges DPDK's mastership by clearing the `I` and `MS` bits and echoing sequence number X.*
-    *   *Upon sending this, FRR moves to `EXCHANGE`. Upon receiving this, DPDK also moves to `EXCHANGE`.*
-    *   --- *`EXCHANGE` State Begins* ---
-    *   `DPDK -> Multicast`: **DD Packet** (Seq=X+1, Flags: M=1, MS=1, Body: LSA Headers)
-        *   *DPDK (MASTER) sends the first packet containing LSA headers.*
-    *   `FRR -> Multicast`: **DD Packet** (Seq=X+1, Flags: M=1, MS=0, Body: LSA Headers)
-        *   *FRR (SLAVE) acknowledges by echoing sequence number X+1 and sends its own LSA headers.*
-    *   *...This poll-response continues until all LSA headers are exchanged...*
-
-3.  **LSA Exchange (Loading -> Full)**
-    *   `DPDK -> Multicast`: **LSR Packet**
-    *   `FRR -> Multicast`: **LSU Packet**
-    *   `DPDK -> Multicast`: **LSAck Packet**
-
-4.  **Adjacency Formed (Full)**
-    *   Once both routers have received and acknowledged all necessary LSAs, the neighbor state transitions to `FULL`.
+*   **Problem**: A sudden spike in latency could still cause a Hello packet to arrive just after the dead timer is scheduled to expire.
+*   **Solution**: The simulator adds a 500ms grace period to its dead timer calculation. With a 10-second dead interval, the simulator will not declare a neighbor dead until it has been silent for 10.5 seconds. This makes the simulator more tolerant of intermittent packet delays.
 
 ## 6. Known Deviations from RFC 2328
 
-This implementation contains specific behaviors that deviate from the OSPFv2 standard as defined in RFC 2328. These changes were implemented to meet the specific requirements of the target simulation environment.
+This implementation contains specific behaviors that deviate from the OSPFv2 standard. These changes were implemented to meet the explicit requirements of the target simulation environment.
 
 ### 1. Destination Address for All OSPF Packets
 
-*   **RFC Standard**: On Point-to-Point networks, only Hello packets are sent to the multicast address `224.0.0.5`. After the `Init` state, all subsequent OSPF packets (DD, LSR, LSU, LSAck) should be sent via **unicast** to the neighbor's IP address.
-*   **Simulator Implementation**: In this simulator, **all** OSPF packets, including DD, LSR, LSU, and LSAck, are sent to the **multicast** address `224.0.0.5`.
+*   **RFC Standard**: On Point-to-Point networks, only Hello packets are sent to the multicast address `224.0.0.5`. After the `Init` state, all subsequent OSPF packets (DD, LSR, LSU, LSAck) should be sent via **unicast**.
+*   **Simulator Implementation**: In this simulator, **all** OSPF packets are sent to the **multicast** address `224.0.0.5`.
+    *   **Reason**: This was explicitly required for interoperability with the target environment.
 
-    *   **Reason**: This change was explicitly required to ensure interoperability with the user's target FRR environment, which appears to expect this behavior in the specific P2P setup.
+### 2. Interface MTU in Database Description (DD) Packets
+
+*   **RFC Standard**: For Point-to-Point interfaces, the MTU field in DD packets should be set to **0**.
+*   **Simulator Implementation**: The MTU field is set to **0** in compliance with the RFC.
+    *   **Reason**: This is a strict requirement for forming an adjacency with RFC-compliant routers like FRR.
+
+### 3. Duplicate Router IDs
+
+*   **RFC Standard**: Every router in an OSPF domain must have a unique Router ID.
+*   **Simulator Implementation**: Both simulated router instances (PID 0 and PID 1) are configured with the same Router ID (`2.2.2.2`).
+    *   **Reason**: This configuration was explicitly requested.
+    *   **Warning**: Using duplicate Router IDs is a violation of the OSPF standard and can lead to unpredictable routing behavior and network instability. It is strongly recommended to use unique Router IDs in a production environment.

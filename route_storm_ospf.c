@@ -179,8 +179,8 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
   /* Set Router IDs based on your topology */
   if (router_id == 0) {
     switch (pid) {
-      case 0: s->router_id = string_to_ip("2.2.2.2"); break;    /* Your router PID 0 */
-      case 1: s->router_id = string_to_ip("3.3.3.3"); break;    /* Your router PID 1 */
+      case 0: s->router_id = string_to_ip("2.2.2.2"); break;
+      case 1: s->router_id = string_to_ip("2.2.2.2"); break;
       default: s->router_id = string_to_ip("192.168.99.100"); break;
     }
   } else {
@@ -196,7 +196,7 @@ int ospf_initialize_test(uint8_t pid, uint32_t router_id, uint32_t area_id)
   s->config.dead_interval  = OSPF_DEAD_INTERVAL;
   s->config.priority = 1;
   s->config.options  = OSPF_OPTION_E;
-  s->config.network_mask = string_to_ip("255.255.255.0");
+  s->config.network_mask = string_to_ip("255.255.255.252");
   s->config.designated_router = 0;
   s->config.backup_dr = 0;
 
@@ -871,57 +871,6 @@ void ospf_start_exchange(ospf_session_t *s, uint8_t iface_index)
       s->pid, ip_to_string(iface->ip_address));
 }
 
-int ospf_process_exchange_steps(ospf_session_t *s, uint8_t pid)
-{
-  uint64_t now = rte_get_tsc_cycles();
-
-  for (int if_idx = 0; if_idx < s->interface_count; if_idx++) {
-    ospf_interface_t *iface = &s->interfaces[if_idx];
-
-    if (iface->exchange_state.step == 0) {
-      continue;
-    }
-
-    if (iface->exchange_state.wait_until > now) {
-      continue;
-    }
-
-    /* Process timeout */
-    switch (iface->exchange_state.step) {
-      case 6: /* Waiting to send LSR */
-        printf("[OSPF PID%u] Step 6: Sending LSR\n", pid);
-        ospf_send_lsr_packet(pid, s, string_to_ip("1.1.1.1"),
-            LSA_TYPE_ROUTER, s->router_id, s->router_id, if_idx);
-        iface->exchange_state.step = 7;
-        iface->exchange_state.wait_until = now + (2 * rte_get_tsc_hz());
-        break;
-
-      case 7: /* Waiting to send LSU */
-        printf("[OSPF PID%u] Step 7: Sending LSU\n", pid);
-        uint8_t lsa_buf[OSPF_MAX_LSA_SIZE];
-        struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
-        ospf_generate_router_lsa(s, lsa, if_idx);
-        struct ospf_lsa_header *lsa_ptr = lsa;
-        ospf_send_lsu_packet(pid, s, string_to_ip("1.1.1.1"),
-            LSA_TYPE_ROUTER, 1, &lsa_ptr, if_idx);
-        iface->exchange_state.step = 8;
-        iface->exchange_state.wait_until = now + (1 * rte_get_tsc_hz());
-        break;
-
-      case 8: /* Waiting to send LSAck */
-        printf("[OSPF PID%u] Step 8: Sending LSAck\n", pid);
-        iface->exchange_state.step = 0;
-        break;
-
-      default:
-        iface->exchange_state.step = 0;
-        break;
-    }
-  }
-
-  return 0;
-}
-
 /* ---------- RX: Hello ---------- */
 
 int ospf_handle_hello_packet(struct ethernet_hdr *eth_hdr,
@@ -1404,12 +1353,13 @@ int ospf_handle_lsack_packet(struct ethernet_hdr *eth_hdr,
 
 /* ---------- Neighbor timeouts / retransmit ---------- */
 
-#define OSPF_DD_RETRANSMIT_INTERVAL 5 /* seconds */
+#define OSPF_DD_RETRANSMIT_INTERVAL 2 /* seconds */
 
 void ospf_process_neighbor_timeouts(ospf_session_t *s, uint8_t pid)
 {
   uint64_t now = rte_get_tsc_cycles();
-  uint64_t dead_cycles = (uint64_t)s->config.dead_interval * rte_get_tsc_hz();
+  uint64_t grace_period_cycles = (uint64_t)(0.5 * rte_get_tsc_hz());
+  uint64_t dead_cycles = (uint64_t)s->config.dead_interval * rte_get_tsc_hz() + grace_period_cycles;
   uint64_t session_timeout_cycles = (uint64_t)OSPF_SESSION_TIMEOUT * rte_get_tsc_hz();
 
   for (int i = 0; i < s->neighbor_count; i++) {
@@ -1529,7 +1479,7 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
       router_id = string_to_ip("2.2.2.2");  /* Your router RID for PID 0 */
       break;
     case 1:
-      router_id = string_to_ip("3.3.3.3");  /* Your router RID for PID 1 */
+      router_id = string_to_ip("2.2.2.2");  /* Your router RID for PID 1 */
       break;
     default:
       router_id = string_to_ip("192.168.99.99");
@@ -1560,7 +1510,7 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
   printf("  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
       mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
 
-  hello_cycles = (uint64_t)s->config.hello_interval * rte_get_tsc_hz();
+  hello_cycles = (uint64_t)(s->config.hello_interval * 0.9 * rte_get_tsc_hz());
 
   /* CRITICAL FIX: Send initial Hello immediately upon startup */
   printf("[OSPF PID%u] Sending INITIAL Hello to discover FRR\n", pid);
@@ -1572,9 +1522,6 @@ int ospf_test_main_loop(uint8_t pid, int userId, uint8_t pairPid)
 
   while (pblast[pid].trafficStatus) {
     uint64_t now = rte_get_tsc_cycles();
-
-    /* Process step-by-step exchange */
-    ospf_process_exchange_steps(s, pid);
 
     /* Send periodic Hellos every hello_interval */
     if (now - last_periodic_hello > hello_cycles) {
