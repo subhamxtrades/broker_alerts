@@ -514,7 +514,7 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
     struct ospf_dd *dd = (struct ospf_dd *)buf;
     memset(dd, 0, total_payload_len);
 
-    dd->mtu = htons(OSPF_DEFAULT_MTU);
+    dd->mtu = htons(0); /* Per RFC 2328, MTU is 0 on Point-to-Point links */
     dd->options = s->config.options;
     dd->flags = flags;
     dd->dd_sequence = htonl(dd_seq);
