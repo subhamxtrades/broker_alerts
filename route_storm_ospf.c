@@ -498,87 +498,66 @@ int ospf_send_dd_packet(uint8_t pid, ospf_session_t *s,
     uint32_t neighbor_rid, uint8_t flags, uint32_t dd_seq,
     bool include_lsa_headers, uint8_t iface_index)
 {
-  if (iface_index >= s->interface_count) return -1;
-  ospf_interface_t *iface = &s->interfaces[iface_index];
+    if (iface_index >= s->interface_count) return -1;
+    ospf_interface_t *iface = &s->interfaces[iface_index];
 
-  uint16_t dd_body_len = sizeof(struct ospf_dd);
-  uint16_t lsa_header_len = 0;
-
-  /* FIX: Calculate the correct total length */
-  if (include_lsa_headers) {
-    /* Generate LSA to get its size */
-    uint8_t lsa_buf[OSPF_MAX_LSA_SIZE];
-    struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)lsa_buf;
-    if (ospf_generate_router_lsa(s, lsa, iface_index) != 0) {
-      printf("[OSPF PID%u] Failed to generate Router LSA\n", pid);
-      return -1;
+    uint16_t lsa_headers_len = 0;
+    if (include_lsa_headers) {
+        // For this simulation, we only ever send our single Router LSA.
+        lsa_headers_len = sizeof(struct ospf_lsa_header);
     }
-    lsa_header_len = ntohs(lsa->length);
-  }
 
-  uint16_t total_len = dd_body_len + lsa_header_len;
-  uint8_t *buf = malloc(total_len);
-  if (!buf) return -1;
+    uint16_t total_payload_len = sizeof(struct ospf_dd) + lsa_headers_len;
+    uint8_t *buf = malloc(total_payload_len);
+    if (!buf) return -1;
 
-  struct ospf_dd *dd = (struct ospf_dd *)buf;
-  memset(dd, 0, total_len);
+    struct ospf_dd *dd = (struct ospf_dd *)buf;
+    memset(dd, 0, total_payload_len);
 
-  /* IMPORTANT: Set MTU to 0 for point-to-point links (RFC 2328) */
-  if (iface->type == OSPF_IFTYPE_P2P) {
-    dd->mtu = htons(0);  /* MTU=0 for P2P links */
-  } else {
     dd->mtu = htons(OSPF_DEFAULT_MTU);
-  }
+    dd->options = s->config.options;
+    dd->flags = flags;
+    dd->dd_sequence = htonl(dd_seq);
 
-  dd->options = s->config.options;
+    if (include_lsa_headers) {
+        uint8_t lsa_buf[OSPF_MAX_LSA_SIZE];
+        struct ospf_lsa_header *generated_lsa = (struct ospf_lsa_header *)lsa_buf;
 
-  /* Set flags correctly */
-  dd->flags = flags;
+        if (ospf_generate_router_lsa(s, generated_lsa, iface_index) != 0) {
+            printf("[PID %u] ERROR | Failed to generate Router LSA for DD packet\n", pid);
+            free(buf);
+            return -1;
+        }
 
-  dd->dd_sequence = htonl(dd_seq);
-
-  /* Add LSA header if requested */
-  if (include_lsa_headers && lsa_header_len > 0) {
-    struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(dd + 1);
-    if (ospf_generate_router_lsa(s, lsa, iface_index) != 0) {
-      printf("[OSPF PID%u] Failed to generate Router LSA for DD\n", pid);
-      free(buf);
-      return -1;
+        /* Per RFC 2328, DD packets contain LSA *headers*, not full LSAs */
+        struct ospf_lsa_header *lsa_in_dd = (struct ospf_lsa_header *)(dd + 1);
+        memcpy(lsa_in_dd, generated_lsa, sizeof(struct ospf_lsa_header));
     }
-  }
 
-  /* Unicast DD packets to the neighbor */
-  ospf_neighbor_t *neighbor = NULL;
-  for (int i = 0; i < s->neighbor_count; i++) {
-    if (s->neighbors[i].router_id == neighbor_rid && s->neighbors[i].interface_index == iface_index) {
-      neighbor = &s->neighbors[i];
-      break;
+    ospf_neighbor_t *neighbor = NULL;
+    for (int i = 0; i < s->neighbor_count; i++) {
+        if (s->neighbors[i].router_id == neighbor_rid) {
+            neighbor = &s->neighbors[i];
+            break;
+        }
     }
-  }
+    if (!neighbor) {
+        printf("[PID %u] ERROR | Cannot send DD to unknown neighbor %s\n", pid, ip_to_string(neighbor_rid));
+        free(buf);
+        return -1;
+    }
+    uint32_t dst_ip = string_to_ip(OSPF_ALLSPFROUTERS_MCAST);
 
-  if (!neighbor) {
-    printf("[OSPF PID%u] ERROR: Cannot send DD to unknown neighbor %s\n", pid, ip_to_string(neighbor_rid));
+    printf("[PID %u] INFO  | Send DD to %s | Seq: %u, Flags: [I:%u, M:%u, MS:%u], LSA Headers: %s\n",
+        pid, ip_to_string(neighbor_rid), dd_seq,
+        (flags & OSPF_DD_FLAG_I) ? 1 : 0,
+        (flags & OSPF_DD_FLAG_M) ? 1 : 0,
+        (flags & OSPF_DD_FLAG_MS) ? 1 : 0,
+        include_lsa_headers ? "YES" : "NO");
+
+    int ret = ospf_send_packet(pid, s, OSPF_TYPE_DD, buf, total_payload_len, dst_ip, iface->ip_address);
     free(buf);
-    return -1;
-  }
-  uint32_t dst_ip = string_to_ip(OSPF_ALLSPFROUTERS_MCAST);
-
-  /* Store IP strings in local buffers to avoid undefined behavior with ip_to_string */
-  char rid_str[16], dst_str[16], iface_str[16];
-  snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(neighbor_rid));
-  snprintf(dst_str, sizeof(dst_str), "%s", ip_to_string(dst_ip));
-  snprintf(iface_str, sizeof(iface_str), "%s", ip_to_string(iface->ip_address));
-
-  printf("[PID %u] INFO  | Sending DD to %s on %s | Seq: %u, Flags: [I:%u, M:%u, MS:%u], MTU: %u\n",
-      pid, rid_str, iface_str, dd_seq,
-      (dd->flags & OSPF_DD_FLAG_I) ? 1 : 0,
-      (dd->flags & OSPF_DD_FLAG_M) ? 1 : 0,
-      (dd->flags & OSPF_DD_FLAG_MS) ? 1 : 0,
-      ntohs(dd->mtu));
-
-  int ret = ospf_send_packet(pid, s, OSPF_TYPE_DD, buf, total_len, dst_ip, iface->ip_address);
-  free(buf);
-  return ret;
+    return ret;
 }
 
 int ospf_send_lsr_packet(uint8_t pid, ospf_session_t *s,
@@ -1057,106 +1036,64 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
     ospf_session_t *s,
     uint32_t src_ip)
 {
-  uint32_t remote_rid = hdr->router_id;  /* Should be 1.1.1.1 */
-  uint32_t dd_seq = ntohl(dd->dd_sequence);
-  uint8_t flags = dd->flags;
+    uint32_t remote_rid = hdr->router_id;
+    uint32_t dd_seq = ntohl(dd->dd_sequence);
+    uint8_t flags = dd->flags;
+    uint8_t iface_index = 0; // Simplified for single interface
 
-  /* Determine interface */
-  uint8_t iface_index = 0;
-  for (int i = 0; i < s->interface_count; i++) {
-    uint32_t network = s->interfaces[i].ip_address & s->interfaces[i].network_mask;
-    uint32_t src_network = src_ip & s->interfaces[i].network_mask;
-    if (network == src_network) {
-      iface_index = i;
-      break;
+    bool has_lsa_headers = dd_contains_lsa_headers(hdr, dd);
+
+    printf("[PID %u] <<< RECV  %-5s | RID: %-15s | SRC: %-15s | Seq: %u, Flags: [I:%u, M:%u, MS:%u]\n",
+        pid, "DD", ip_to_string(remote_rid), ip_to_string(src_ip), dd_seq,
+        (flags & OSPF_DD_FLAG_I) ? 1 : 0, (flags & OSPF_DD_FLAG_M) ? 1 : 0, (flags & OSPF_DD_FLAG_MS) ? 1 : 0);
+
+    ospf_neighbor_t *nbr = NULL;
+    for (int i = 0; i < s->neighbor_count; i++) {
+        if (s->neighbors[i].router_id == remote_rid) {
+            nbr = &s->neighbors[i];
+            break;
+        }
     }
-  }
-
-  uint16_t ospf_len = ntohs(hdr->length);
-  bool has_lsa_headers = dd_contains_lsa_headers(hdr, dd);
-
-  printf("[PID %u] <<< RECV  %-5s | RID: %-15s | SRC: %-15s | IFACE: %u | LEN: %u\n",
-      pid, "DD", ip_to_string(remote_rid), ip_to_string(src_ip), iface_index, ospf_len);
-
-  printf("[PID %u] INFO  | DD from %s | Seq: %u, Flags: [I:%u, M:%u, MS:%u], Has LSA: %s\n",
-      pid, ip_to_string(remote_rid), dd_seq,
-      (flags & OSPF_DD_FLAG_I) ? 1 : 0,
-      (flags & OSPF_DD_FLAG_M) ? 1 : 0,
-      (flags & OSPF_DD_FLAG_MS) ? 1 : 0,
-      has_lsa_headers ? "YES" : "NO");
-
-  ospf_neighbor_t *nbr = NULL;
-  for (int i = 0; i < s->neighbor_count; i++) {
-    if (s->neighbors[i].router_id == remote_rid &&
-        s->neighbors[i].interface_index == iface_index) {
-      nbr = &s->neighbors[i];
-      break;
+    if (!nbr) {
+        printf("[PID %u] WARN  | DD from unknown neighbor %s\n", pid, ip_to_string(remote_rid));
+        return -1;
     }
-  }
-  if (!nbr) {
-    printf("[PID %u] WARN  | DD from unknown neighbor %s\n", pid, ip_to_string(remote_rid));
-    return -1;
-  }
 
-  /* Per RFC 2328, DD packets are ignored in states < ExStart */
-  if (nbr->state < OSPF_STATE_EXSTART) {
-    char rid_str[16];
-    snprintf(rid_str, sizeof(rid_str), "%s", ip_to_string(remote_rid));
-    printf("[OSPF PID%u] Received DD from %s in state %s, ignoring packet.\n",
-        pid, rid_str, ospf_state_to_string(nbr->state));
-    return 0;
-  }
+    if (nbr->state < OSPF_STATE_EXSTART) {
+        return 0; // Ignore DD packets in lower states
+    }
 
-  nbr->last_dd_received = rte_get_tsc_cycles();
+    nbr->last_dd_received = rte_get_tsc_cycles();
 
-  /* RFC 2328 Section 10.8: Receiving Database Description Packets */
-  switch (nbr->state) {
-    case OSPF_STATE_DOWN:
-    case OSPF_STATE_ATTEMPT:
-    case OSPF_STATE_TWO_WAY:
-        /* DD packets are not expected in these states. Ignore. */
-        printf("[PID %u] WARN  | Received DD from %s in unexpected state %s. Ignoring.\n",
-               pid, ip_to_string(remote_rid), ospf_state_to_string(nbr->state));
-        break;
+    if (nbr->state == OSPF_STATE_EXSTART) {
+        bool peer_claims_master = (flags & OSPF_DD_FLAG_MS);
+        bool we_should_be_master = (ntohl(s->router_id) > ntohl(remote_rid));
 
-    case OSPF_STATE_INIT:
-        /* This is an error, should have transitioned to 2-Way first. Resetting. */
-        printf("[PID %u] ERROR | Received DD from %s in INIT state. Resetting neighbor.\n",
-               pid, ip_to_string(remote_rid));
-        ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_DOWN);
-        break;
-
-    case OSPF_STATE_EXSTART:
-        if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_M) && (flags & OSPF_DD_FLAG_MS) &&
-            !has_lsa_headers && (ntohl(remote_rid) > ntohl(s->router_id))) {
-            /* Peer is master, we must be slave. */
+        if (peer_claims_master && !we_should_be_master) {
+            // Peer is master, and we agree. We become slave.
             printf("[PID %u] STATE | [EXSTART] Peer %s is MASTER. We are SLAVE.\n", pid, ip_to_string(remote_rid));
             nbr->is_master = 0;
             nbr->dd_sequence = dd_seq;
             ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
-            /* As slave, our first packet echoes the master's seq num, with our own DD summary */
+            // Acknowledge by sending our DD with their sequence number.
             ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, nbr->dd_sequence, true, iface_index);
 
-        } else if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) &&
-                   (dd_seq == nbr->dd_sequence) && (ntohl(s->router_id) > ntohl(remote_rid))) {
-            /* We are master, and slave has acknowledged our mastership. */
-            printf("[PID %u] STATE | [EXSTART] Peer %s is SLAVE. Moving to EXCHANGE.\n", pid, ip_to_string(remote_rid));
-            ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
-            /* Start sending our DD summary */
-            nbr->dd_sequence++;
-            ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, true, iface_index);
-
-        } else if ((flags & OSPF_DD_FLAG_I) && (ntohl(s->router_id) > ntohl(remote_rid))) {
-             /* Mastership conflict. Our RID is higher, so we re-send our initial DD packet to assert master. */
-             printf("[PID %u] WARN  | [EXSTART] Mastership conflict with %s. Re-asserting master role.\n",
-                    pid, ip_to_string(remote_rid));
-             ospf_send_dd_packet(pid, s, nbr->router_id, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, false, nbr->interface_index);
-             nbr->last_dd_sent = rte_get_tsc_cycles(); /* Reset retransmission timer */
+        } else if (!peer_claims_master && we_should_be_master) {
+            // We are master, and peer acknowledges.
+             if (dd_seq == nbr->dd_sequence) {
+                printf("[PID %u] STATE | [EXSTART] Peer %s acknowledged SLAVE. Moving to EXCHANGE.\n", pid, ip_to_string(remote_rid));
+                ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_EXCHANGE);
+                // Start sending our LSA headers, incrementing the sequence number
+                nbr->dd_sequence++;
+                ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, nbr->dd_sequence, true, iface_index);
+            }
+        } else if (peer_claims_master && we_should_be_master) {
+            // Mastership conflict. Our RID is higher. We ignore their packet and wait for our retransmit timer to fire.
+            printf("[PID %u] WARN  | [EXSTART] Mastership conflict with %s. Our RID is higher. Ignoring their DD.\n", pid, ip_to_string(remote_rid));
         }
-        break;
 
-    case OSPF_STATE_EXCHANGE:
-        /* Packet Validation: I-bit must be 0, MS-bit must be opposite of ours, and sequence numbers must match expectations. */
+    } else if (nbr->state == OSPF_STATE_EXCHANGE) {
+        // Exchange state logic remains the same...
         if ((flags & OSPF_DD_FLAG_I) ||
             ((flags & OSPF_DD_FLAG_MS) == nbr->is_master) ||
             (nbr->is_master && (dd_seq != nbr->dd_sequence)) ||
@@ -1167,68 +1104,40 @@ int ospf_handle_dd_packet(struct ethernet_hdr *eth_hdr,
         }
 
         if (has_lsa_headers) {
-            struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(dd + 1);
-            uint16_t ospf_len = ntohs(hdr->length);
-            uint16_t headers_section_len = ospf_len - sizeof(struct ospf_header) - sizeof(struct ospf_dd);
+             struct ospf_lsa_header *lsa = (struct ospf_lsa_header *)(dd + 1);
+            uint16_t headers_section_len = ntohs(hdr->length) - sizeof(struct ospf_header) - sizeof(struct ospf_dd);
             int num_lsa_headers = headers_section_len / sizeof(struct ospf_lsa_header);
-
-            printf("[PID %u] INFO  | DD packet contains %d LSA headers.\n", pid, num_lsa_headers);
-
             for (int i = 0; i < num_lsa_headers; i++) {
                 if (nbr->ls_request_count < OSPF_MAX_LSAS_PER_UPDATE) {
-                    memcpy(&nbr->ls_request_list[nbr->ls_request_count], lsa, sizeof(struct ospf_lsa_header));
-                    nbr->ls_request_count++;
+                    memcpy(&nbr->ls_request_list[nbr->ls_request_count++], lsa, sizeof(struct ospf_lsa_header));
                 }
-                /* Advance pointer by the size of the LSA header, not the full LSA length */
-                lsa = (struct ospf_lsa_header *)((uint8_t *)lsa + sizeof(struct ospf_lsa_header));
+                lsa++;
             }
         }
 
         if (nbr->is_master) {
              if (dd_seq == nbr->dd_sequence) {
-                /* Slave acknowledged our last DD packet. We can send the next one. */
-                bool we_have_more = false; /* Simplified: We assume all LSAs fit in one packet */
-
-                if (we_have_more) {
-                    nbr->dd_sequence++;
-                    // ospf_send_dd_packet(pid, s, ...);
-                } else if (flags & OSPF_DD_FLAG_M) {
-                    /* Slave has more LSAs. We need to poll for them. */
-                    nbr->dd_sequence++;
-                    ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_MS, nbr->dd_sequence, false, iface_index);
-                } else {
-                    /* Neither has more. Exchange is done. */
+                if (!(flags & OSPF_DD_FLAG_M)) {
                     printf("[PID %u] STATE | [EXCHANGE] Master: Exchange complete with %s.\n", pid, ip_to_string(remote_rid));
                     ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
+                } else {
+                    nbr->dd_sequence++;
+                    ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_MS, nbr->dd_sequence, false, iface_index);
                 }
              }
-        } else { // We are slave
-            if (dd_seq == nbr->dd_sequence + 1) {
-                nbr->dd_sequence = dd_seq;
-                /* Master has sent next DD packet. */
-                bool we_have_more = false; /* Simplified */
-
-                if (!(flags & OSPF_DD_FLAG_M) && !we_have_more) {
-                    printf("[PID %u] STATE | [EXCHANGE] Slave: Exchange complete with %s.\n", pid, ip_to_string(remote_rid));
-                    ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
-                }
-                /* Acknowledge and send our next DD packet (which is empty in our simple case) */
-                ospf_send_dd_packet(pid, s, remote_rid, we_have_more ? OSPF_DD_FLAG_M : 0, nbr->dd_sequence, false, iface_index);
+        } else { // Slave
+            nbr->dd_sequence = dd_seq;
+            if (!(flags & OSPF_DD_FLAG_M)) {
+                printf("[PID %u] STATE | [EXCHANGE] Slave: Exchange complete with %s.\n", pid, ip_to_string(remote_rid));
+                 ospf_send_dd_packet(pid, s, remote_rid, 0, nbr->dd_sequence, false, iface_index);
+                ospf_update_neighbor_state(s, remote_rid, iface_index, OSPF_STATE_LOADING);
+            } else {
+                ospf_send_dd_packet(pid, s, remote_rid, OSPF_DD_FLAG_M, nbr->dd_sequence, true, iface_index);
             }
         }
-        break;
+    }
 
-    case OSPF_STATE_LOADING:
-    case OSPF_STATE_FULL:
-        /* In these states, we should only process duplicate DD packets. */
-        if (dd_seq == nbr->dd_sequence && !nbr->is_master) {
-             /* Slave re-acknowledging master's last packet */
-             ospf_send_dd_packet(pid, s, remote_rid, 0, nbr->dd_sequence, false, iface_index);
-        }
-        break;
-  }
-
-  return 0;
+    return 0;
 }
 
 /* ---------- RX: LSR / LSU / LSAck ---------- */

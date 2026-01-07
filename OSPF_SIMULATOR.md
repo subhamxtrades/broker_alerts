@@ -110,7 +110,7 @@ interface ens37
   ip ospf dead-interval 12
   ip ospf retransmit-interval 2
   ip ospf mtu-ignore
-  ip ospf priority 1
+  ip ospf priority 255
 exit
 !
 interface ens38
@@ -120,7 +120,7 @@ interface ens38
   ip ospf dead-interval 12
   ip ospf retransmit-interval 2
   ip ospf mtu-ignore
-  ip ospf priority 1
+  ip ospf priority 0
 exit
 !
 
@@ -135,6 +135,8 @@ exit
 # Exit configuration mode
 end
 ```
+
+> **Note on Interface Priority**: The use of different OSPF priorities (`255` and `0`) is a critical part of this configuration. Because the simulator uses a non-standard duplicate Router ID (`2.2.2.2`) for both of its interfaces, FRR can become confused during the master/slave negotiation process. Setting a high priority on one interface and a low priority on the other helps FRR to deterministically choose a master, preventing the adjacency from getting stuck in the `ExStart` state.
 
 ## 5. Timing and Latency Compensation
 
