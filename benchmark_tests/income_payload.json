@@ -1,0 +1,23 @@
+{
+  "income_type": "INCOME",
+  "user_id": 15,
+  "contact_id": 4,
+  "is_recurring": true,
+  "repeat_frequency_type_id": 3,
+  "start_date": "2025-12-30T17:27:36.933Z",
+  "end_date": "2025-12-30T17:27:36.933Z",
+  "never_expires": false,
+  "invoice_date": "2025-12-30T17:27:36.933Z",
+  "due_date": "2025-12-30T17:27:36.933Z",
+  "additional_notes": "additional notes for benchmark testing",
+  "terms_and_conditions": "terms and conditions for benchmark testing",
+  "payment_type_id": 3,
+  "invoice_number": "BENCH-2025",
+  "items": [
+    "1",
+    "2"
+  ],
+  "attachments": [],
+  "is_draft": false,
+  "account_id": 123
+}
