@@ -6,10 +6,15 @@ This directory contains a set of scripts designed to benchmark the web API using
 
 ## Prerequisites
 
-1.  **Apache Bench (`ab`)**: You must have `ab` installed. On Debian-based systems (like Ubuntu), you can install it with the following command:
-    ```bash
-    sudo apt-get update && sudo apt-get install -y apache2-utils
-    ```
+1.  **Apache Bench (`ab`)**: You must have `ab` installed.
+    - On **Debian-based systems (like Ubuntu)**, you can install it with:
+      ```bash
+      sudo apt-get update && sudo apt-get install -y apache2-utils
+      ```
+    - On **CentOS 9**, you can install it with:
+      ```bash
+      sudo dnf install -y httpd-tools
+      ```
 2.  **Running API Server**: The API server must be running and accessible from the machine where you intend to run these tests.
 
 ## Configuration
