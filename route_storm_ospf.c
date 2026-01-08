@@ -55,12 +55,17 @@ static void run_dr_bdr_election(struct ospf_virtual_interface *vif);
 static void ospf_handle_dd_packet(struct ospf_dd_packet *dd_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool);
 static void ospf_handle_lsr_packet(struct ospf_lsr_packet *lsr_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool);
 static void ospf_handle_lsu_packet(struct ospf_lsu_packet *lsu_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool);
+static void send_lsu_packet(struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool, struct lsdb_entry *lsa);
+static void send_lsack_packet(struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool, struct lsa_header *lsa);
 static void ospf_handle_lsack_packet(struct ospf_lsack_packet *lsack_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool);
 static struct ospf_virtual_interface *find_virtual_interface(uint16_t port_id, struct rte_ether_addr *mac);
 static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool);
 static uint16_t ospf_checksum(const void *data, size_t len);
 static int load_config(const char *filename);
 static void display_stats(void);
+static struct lsdb_entry *lsdb_find(struct ospf_router_instance *router, uint32_t link_state_id, uint32_t advertising_router);
+static void lsdb_add(struct ospf_router_instance *router, struct lsa_header *lsa);
+static void lsdb_remove(struct ospf_router_instance *router, struct lsdb_entry *entry);
 
 
 int main(int argc, char *argv[]) {
@@ -433,13 +438,244 @@ static void ospf_handle_dd_packet(struct ospf_dd_packet *dd_pkt, struct ospf_vir
     }
 
     if (!(dd_pkt->db_description_bits & OSPF_DD_M_BIT)) {
-        neighbor->state = LOADING;
+        if (neighbor->retransmission_list_len == 0) {
+            neighbor->state = FULL;
+        } else {
+            neighbor->state = LOADING;
+        }
     }
 }
 
-static void ospf_handle_lsr_packet(struct ospf_lsr_packet *lsr_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool) {}
-static void ospf_handle_lsu_packet(struct ospf_lsu_packet *lsu_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool) {}
-static void ospf_handle_lsack_packet(struct ospf_lsack_packet *lsack_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool) {}
+static void ospf_handle_lsr_packet(struct ospf_lsr_packet *lsr_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool) {
+    vif->packets_received++;
+    struct lsdb_entry *entry = lsdb_find(vif->router, lsr_pkt->link_state_id, lsr_pkt->advertising_router);
+    if (entry) {
+        send_lsu_packet(vif, mbuf_pool, entry);
+    }
+}
+
+static void send_lsu_packet(struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool, struct lsdb_entry *lsa) {
+    const unsigned lsa_len = rte_be_to_cpu_16(lsa->lsa.length);
+    const unsigned total_length = sizeof(struct rte_ether_hdr) +
+                                  sizeof(struct rte_ipv4_hdr) +
+                                  sizeof(struct ospf_lsu_packet) + lsa_len;
+
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (!mbuf) {
+        return;
+    }
+
+    mbuf->data_len = total_length;
+    mbuf->pkt_len = total_length;
+
+    // Ethernet header
+    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    eth_hdr->src_addr = vif->mac_addr;
+    eth_hdr->dst_addr = (struct rte_ether_addr){.addr_bytes = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x05}};
+    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    // IP header
+    struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+    ip_hdr->version_ihl = (4 << 4) | 5;
+    ip_hdr->type_of_service = 0;
+    ip_hdr->total_length = rte_cpu_to_be_16(total_length - sizeof(struct rte_ether_hdr));
+    ip_hdr->packet_id = 0;
+    ip_hdr->fragment_offset = 0;
+    ip_hdr->time_to_live = 1;
+    ip_hdr->next_proto_id = IP_PROTOCOL_OSPF;
+    ip_hdr->hdr_checksum = 0;
+    ip_hdr->src_addr = vif->ip_address;
+    inet_pton(AF_INET, OSPF_ALL_SPFRouters, &ip_hdr->dst_addr);
+
+    // OSPF LSU packet
+    struct ospf_lsu_packet *lsu_pkt = (struct ospf_lsu_packet *)(ip_hdr + 1);
+    lsu_pkt->header.version = OSPF_VERSION;
+    lsu_pkt->header.type = OSPF_LSU;
+    lsu_pkt->header.packet_length = rte_cpu_to_be_16(sizeof(struct ospf_lsu_packet) + lsa_len);
+    lsu_pkt->header.router_id = vif->router->router_id;
+    lsu_pkt->header.area_id = rte_cpu_to_be_32(0);
+    lsu_pkt->header.checksum = 0;
+    lsu_pkt->num_lsas = rte_cpu_to_be_32(1);
+    rte_memcpy(lsu_pkt->lsas, &lsa->lsa, lsa_len);
+
+    // Checksums
+    ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+    lsu_pkt->header.checksum = ospf_checksum(lsu_pkt, sizeof(struct ospf_lsu_packet) + lsa_len);
+
+    // Send the packet
+    const uint16_t nb_tx = rte_eth_tx_burst(vif->port_id, 0, &mbuf, 1);
+    if (nb_tx > 0) {
+        vif->packets_sent++;
+    } else {
+        rte_pktmbuf_free(mbuf);
+    }
+}
+
+static int is_lsa_newer(struct lsa_header *lsa1, struct lsa_header *lsa2);
+
+static void ospf_handle_lsu_packet(struct ospf_lsu_packet *lsu_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool) {
+    vif->packets_received++;
+
+    char *ptr = (char *)lsu_pkt->lsas;
+    for (int i = 0; i < rte_be_to_cpu_32(lsu_pkt->num_lsas); i++) {
+        struct lsa_header *lsa = (struct lsa_header *)ptr;
+
+        struct lsdb_entry *entry = lsdb_find(vif->router, lsa->link_state_id, lsa->advertising_router);
+        if (entry && !is_lsa_newer(lsa, &entry->lsa)) {
+            ptr += rte_be_to_cpu_16(lsa->length);
+            continue;
+        }
+
+        if (entry) {
+            lsdb_remove(vif->router, entry);
+        }
+        lsdb_add(vif->router, lsa);
+
+        // Flood to other neighbors
+        for (int k = 0; k < vif->num_neighbors; k++) {
+            struct ospf_neighbor *neighbor = &vif->neighbors[k];
+            if (neighbor->state >= EXCHANGE) {
+                // Don't flood back to the sender
+                if (neighbor->id != lsu_pkt->header.router_id) {
+                    send_lsu_packet(vif, mbuf_pool, lsdb_find(vif->router, lsa->link_state_id, lsa->advertising_router));
+                }
+            }
+        }
+
+        send_lsack_packet(vif, mbuf_pool, lsa);
+
+        ptr += rte_be_to_cpu_16(lsa->length);
+    }
+
+    struct ospf_neighbor *neighbor = NULL;
+    for (int i = 0; i < vif->num_neighbors; i++) {
+        if (vif->neighbors[i].id == lsu_pkt->header.router_id) {
+            neighbor = &vif->neighbors[i];
+            break;
+        }
+    }
+
+    if (neighbor && neighbor->state == LOADING && neighbor->retransmission_list_len == 0) {
+        neighbor->state = FULL;
+    }
+}
+
+static void send_lsack_packet(struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool, struct lsa_header *lsa) {
+    const unsigned total_length = sizeof(struct rte_ether_hdr) +
+                                  sizeof(struct rte_ipv4_hdr) +
+                                  sizeof(struct ospf_lsack_packet) + sizeof(struct lsa_header);
+
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (!mbuf) {
+        return;
+    }
+
+    mbuf->data_len = total_length;
+    mbuf->pkt_len = total_length;
+
+    // Ethernet header
+    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    eth_hdr->src_addr = vif->mac_addr;
+    eth_hdr->dst_addr = (struct rte_ether_addr){.addr_bytes = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x05}};
+    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    // IP header
+    struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+    ip_hdr->version_ihl = (4 << 4) | 5;
+    ip_hdr->type_of_service = 0;
+    ip_hdr->total_length = rte_cpu_to_be_16(total_length - sizeof(struct rte_ether_hdr));
+    ip_hdr->packet_id = 0;
+    ip_hdr->fragment_offset = 0;
+    ip_hdr->time_to_live = 1;
+    ip_hdr->next_proto_id = IP_PROTOCOL_OSPF;
+    ip_hdr->hdr_checksum = 0;
+    ip_hdr->src_addr = vif->ip_address;
+    inet_pton(AF_INET, OSPF_ALL_SPFRouters, &ip_hdr->dst_addr);
+
+    // OSPF LSAck packet
+    struct ospf_lsack_packet *lsack_pkt = (struct ospf_lsack_packet *)(ip_hdr + 1);
+    lsack_pkt->header.version = OSPF_VERSION;
+    lsack_pkt->header.type = OSPF_LSACK;
+    lsack_pkt->header.packet_length = rte_cpu_to_be_16(sizeof(struct ospf_lsack_packet) + sizeof(struct lsa_header));
+    lsack_pkt->header.router_id = vif->router->router_id;
+    lsack_pkt->header.area_id = rte_cpu_to_be_32(0);
+    lsack_pkt->header.checksum = 0;
+    rte_memcpy(lsack_pkt->lsa_headers, lsa, sizeof(struct lsa_header));
+
+    // Checksums
+    ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+    lsack_pkt->header.checksum = ospf_checksum(lsack_pkt, sizeof(struct ospf_lsack_packet) + sizeof(struct lsa_header));
+
+    // Send the packet
+    const uint16_t nb_tx = rte_eth_tx_burst(vif->port_id, 0, &mbuf, 1);
+    if (nb_tx > 0) {
+        vif->packets_sent++;
+    } else {
+        rte_pktmbuf_free(mbuf);
+    }
+}
+
+static int is_lsa_newer(struct lsa_header *lsa1, struct lsa_header *lsa2) {
+    int32_t seq1 = rte_be_to_cpu_32(lsa1->ls_sequence_number);
+    int32_t seq2 = rte_be_to_cpu_32(lsa2->ls_sequence_number);
+
+    if (seq1 > seq2) {
+        return 1;
+    }
+    if (seq1 < seq2) {
+        return 0;
+    }
+
+    if (rte_be_to_cpu_16(lsa1->ls_checksum) > rte_be_to_cpu_16(lsa2->ls_checksum)) {
+        return 1;
+    }
+    if (rte_be_to_cpu_16(lsa1->ls_checksum) < rte_be_to_cpu_16(lsa2->ls_checksum)) {
+        return 0;
+    }
+
+    if (rte_be_to_cpu_16(lsa1->ls_age) == 3600 && rte_be_to_cpu_16(lsa2->ls_age) < 3600) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static void ospf_handle_lsack_packet(struct ospf_lsack_packet *lsack_pkt, struct ospf_virtual_interface *vif, struct rte_mempool *mbuf_pool) {
+    vif->packets_received++;
+
+    struct ospf_neighbor *neighbor = NULL;
+    for (int i = 0; i < vif->num_neighbors; i++) {
+        if (vif->neighbors[i].id == lsack_pkt->header.router_id) {
+            neighbor = &vif->neighbors[i];
+            break;
+        }
+    }
+
+    if (!neighbor) {
+        return;
+    }
+
+    char *ptr = (char *)lsack_pkt->lsa_headers;
+    int num_lsas = (rte_be_to_cpu_16(lsack_pkt->header.packet_length) - sizeof(struct ospf_lsack_packet)) / sizeof(struct lsa_header);
+
+    for (int i = 0; i < num_lsas; i++) {
+        struct lsa_header *lsa = (struct lsa_header *)ptr;
+
+        for (int j = 0; j < neighbor->retransmission_list_len; j++) {
+            if (neighbor->retransmission_list[j]->lsa.link_state_id == lsa->link_state_id &&
+                neighbor->retransmission_list[j]->lsa.advertising_router == lsa->advertising_router) {
+
+                for (int k = j; k < neighbor->retransmission_list_len - 1; k++) {
+                    neighbor->retransmission_list[k] = neighbor->retransmission_list[k + 1];
+                }
+                neighbor->retransmission_list_len--;
+                break;
+            }
+        }
+
+        ptr += sizeof(struct lsa_header);
+    }
+}
 
 static struct ospf_virtual_interface *find_virtual_interface(uint16_t port_id, struct rte_ether_addr *mac) {
     for (int i = 0; i < g_ospf_simulator.num_router_instances; i++) {
@@ -603,5 +839,46 @@ static void display_stats(void) {
             }
         }
         printf("\n");
+    }
+}
+
+static struct lsdb_entry *lsdb_find(struct ospf_router_instance *router, uint32_t link_state_id, uint32_t advertising_router) {
+    for (int i = 0; i < router->lsdb_len; i++) {
+        if (router->lsdb[i]->lsa.link_state_id == link_state_id &&
+            router->lsdb[i]->lsa.advertising_router == advertising_router) {
+            return router->lsdb[i];
+        }
+    }
+    return NULL;
+}
+
+static void lsdb_add(struct ospf_router_instance *router, struct lsa_header *lsa) {
+    if (router->lsdb_len >= OSPF_MAX_LSA) {
+        return;
+    }
+
+    struct lsdb_entry *entry = rte_malloc(NULL, sizeof(struct lsdb_entry) + rte_be_to_cpu_16(lsa->length), 0);
+    if (!entry) {
+        return;
+    }
+
+    rte_memcpy(&entry->lsa, lsa, rte_be_to_cpu_16(lsa->length));
+    router->lsdb[router->lsdb_len++] = entry;
+}
+
+static void lsdb_remove(struct ospf_router_instance *router, struct lsdb_entry *entry) {
+    int i;
+    for (i = 0; i < router->lsdb_len; i++) {
+        if (router->lsdb[i] == entry) {
+            break;
+        }
+    }
+
+    if (i < router->lsdb_len) {
+        rte_free(router->lsdb[i]);
+        for (int j = i; j < router->lsdb_len - 1; j++) {
+            router->lsdb[j] = router->lsdb[j + 1];
+        }
+        router->lsdb_len--;
     }
 }

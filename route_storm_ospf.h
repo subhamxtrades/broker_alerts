@@ -130,6 +130,16 @@ enum ospf_neighbor_state {
 
 #define OSPF_MAX_ROUTER_INSTANCES 16
 #define OSPF_MAX_VIRTUAL_INTERFACES 4
+#define OSPF_MAX_LSA 1024
+
+/*
+ * LSDB Entry
+ * Represents a single LSA in the Link-State Database.
+ */
+struct lsdb_entry {
+    struct lsa_header lsa;
+    uint8_t data[1]; // Flexible array member
+};
 
 struct ospf_virtual_interface; // Forward declaration
 
@@ -146,6 +156,8 @@ struct ospf_neighbor {
     struct ospf_virtual_interface *interface;
     uint64_t packets_sent;
     uint64_t packets_received;
+    struct lsdb_entry *retransmission_list[OSPF_MAX_LSA];
+    int retransmission_list_len;
 };
 
 /*
@@ -177,6 +189,8 @@ struct ospf_router_instance {
     uint32_t router_id;
     struct ospf_virtual_interface virtual_interfaces[OSPF_MAX_VIRTUAL_INTERFACES];
     int num_virtual_interfaces;
+    struct lsdb_entry *lsdb[OSPF_MAX_LSA];
+    int lsdb_len;
 };
 
 /*
