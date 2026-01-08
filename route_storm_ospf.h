@@ -2,6 +2,7 @@
 #define ROUTE_STORM_OSPF_H
 
 #include <stdint.h>
+#include <rte_ether.h>
 
 #define OSPF_VERSION 2
 #define OSPF_ALL_SPFRouters "224.0.0.5"
@@ -127,7 +128,10 @@ enum ospf_neighbor_state {
 #define OSPF_DD_M_BIT 0x02
 #define OSPF_DD_MS_BIT 0x01
 
-struct ospf_interface; // Forward declaration
+#define OSPF_MAX_ROUTER_INSTANCES 16
+#define OSPF_MAX_VIRTUAL_INTERFACES 4
+
+struct ospf_virtual_interface; // Forward declaration
 
 /*
  * OSPF Neighbor
@@ -139,14 +143,21 @@ struct ospf_neighbor {
     enum ospf_neighbor_state state;
     uint32_t dd_sequence_number;
     uint8_t is_master;
-    struct ospf_interface *interface;
+    struct ospf_virtual_interface *interface;
+    uint64_t packets_sent;
+    uint64_t packets_received;
 };
 
 /*
- * OSPF Interface
- * Represents a network interface on which OSPF is running.
+ * OSPF Virtual Interface
+ * Represents a virtual interface on which OSPF is running.
  */
-struct ospf_interface {
+struct ospf_router_instance; // Forward declaration
+
+struct ospf_virtual_interface {
+    struct ospf_router_instance *router;
+    uint16_t port_id;
+    struct rte_ether_addr mac_addr;
     uint32_t ip_address;
     uint32_t network_mask;
     uint8_t router_priority;
@@ -154,6 +165,27 @@ struct ospf_interface {
     uint32_t backup_router;
     struct ospf_neighbor neighbors[OSPF_MAX_NEIGHBORS];
     int num_neighbors;
+    uint64_t packets_sent;
+    uint64_t packets_received;
+};
+
+/*
+ * OSPF Router Instance
+ * Represents a simulated OSPF router.
+ */
+struct ospf_router_instance {
+    uint32_t router_id;
+    struct ospf_virtual_interface virtual_interfaces[OSPF_MAX_VIRTUAL_INTERFACES];
+    int num_virtual_interfaces;
+};
+
+/*
+ * OSPF Simulator
+ * The top-level data structure for the OSPF simulator.
+ */
+struct ospf_simulator {
+    struct ospf_router_instance router_instances[OSPF_MAX_ROUTER_INSTANCES];
+    int num_router_instances;
 };
 
 #endif // ROUTE_STORM_OSPF_H
