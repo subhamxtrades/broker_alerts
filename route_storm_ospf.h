@@ -55,6 +55,14 @@ struct lsa_header {
     uint16_t length;
 };
 
+struct ospf_router_lsa_link {
+    uint32_t link_id;
+    uint32_t link_data;
+    uint8_t type;
+    uint8_t num_tos;
+    uint16_t metric;
+};
+
 /*
  * Database Description (DD) Packet
  * Used to exchange database summaries.
@@ -128,8 +136,9 @@ enum ospf_neighbor_state {
 #define OSPF_DD_M_BIT 0x02
 #define OSPF_DD_MS_BIT 0x01
 
-#define OSPF_MAX_ROUTER_INSTANCES 16
+#define OSPF_MAX_ROUTER_INSTANCES 1000
 #define OSPF_MAX_VIRTUAL_INTERFACES 4
+#define OSPF_MAX_IPS_PER_VIF 128
 #define OSPF_MAX_LSA 1024
 
 /*
@@ -137,8 +146,8 @@ enum ospf_neighbor_state {
  * Represents a single LSA in the Link-State Database.
  */
 struct lsdb_entry {
-    struct lsa_header lsa;
-    uint8_t data[1]; // Flexible array member
+    uint64_t last_retransmitted;
+    struct lsa_header lsa[]; // Flexible array member
 };
 
 struct ospf_virtual_interface; // Forward declaration
@@ -158,6 +167,7 @@ struct ospf_neighbor {
     uint64_t packets_received;
     struct lsdb_entry *retransmission_list[OSPF_MAX_LSA];
     int retransmission_list_len;
+    uint64_t last_seen;
 };
 
 /*
@@ -170,8 +180,12 @@ struct ospf_virtual_interface {
     struct ospf_router_instance *router;
     uint16_t port_id;
     struct rte_ether_addr mac_addr;
-    uint32_t ip_address;
+    uint32_t ip_addresses[OSPF_MAX_IPS_PER_VIF];
+    int num_ip_addresses;
     uint32_t network_mask;
+    uint32_t area;
+    uint16_t hello_interval;
+    uint16_t dead_interval;
     uint8_t router_priority;
     uint32_t designated_router;
     uint32_t backup_router;
@@ -200,6 +214,28 @@ struct ospf_router_instance {
 struct ospf_simulator {
     struct ospf_router_instance router_instances[OSPF_MAX_ROUTER_INSTANCES];
     int num_router_instances;
+    int num_hosts;
+    uint32_t start_ip;
+    struct rte_ether_addr start_mac;
+};
+
+enum timer_type {
+    HELLO_TIMER,
+    DEAD_TIMER,
+    LSA_AGING_TIMER,
+    LSA_RETRANSMIT_TIMER,
+    LSA_GENERATE_TIMER,
+};
+
+struct timer {
+    enum timer_type type;
+    uint64_t expiration;
+    void *data;
+    struct timer *next;
+};
+
+struct timer_wheel {
+    struct timer *slots[1024];
 };
 
 #endif // ROUTE_STORM_OSPF_H

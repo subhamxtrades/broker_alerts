@@ -32,10 +32,18 @@ The OSPF simulator is configured using a simple, line-based configuration file n
 
 The configuration file is organized into sections, with each section starting with a section header in square brackets (e.g., `[router]`). The following sections are supported:
 
+-   `[simulator]`: Global settings for the simulator.
 -   `[router]`: Defines a new OSPF router instance.
 -   `[interface]`: Defines a new virtual interface for the current router instance.
 
 Within each section, key-value pairs are used to specify the configuration parameters. The following parameters are supported:
+
+**`[simulator]` section:**
+
+-   `num_routers`: The number of OSPF router instances to simulate. The maximum is 1000.
+-   `num_hosts`: If specified, the simulator will auto-generate `num_hosts` router instances with sequential IP and MAC addresses, ignoring `[router]` sections.
+-   `start_ip`: The starting IP address for auto-generation.
+-   `start_mac`: The starting MAC address for auto-generation.
 
 **`[router]` section:**
 
@@ -45,8 +53,12 @@ Within each section, key-value pairs are used to specify the configuration param
 
 -   `port`: The physical DPDK port number that this virtual interface should be mapped to.
 -   `mac`: The MAC address for this virtual interface, in the format `XX:XX:XX:XX:XX:XX`.
--   `ip`: The IP address for this virtual interface, in dotted-decimal notation.
+-   `ip`: A single IP address or a comma-separated list of IP addresses for this virtual interface, in dotted-decimal notation.
 -   `netmask`: The network mask for this virtual interface, in dotted-decimal notation.
+-   `area`: The OSPF area for this interface, in dotted-decimal notation.
+-   `hello_interval`: The interval between OSPF Hello packets, in seconds.
+-   `dead_interval`: The interval after which a neighbor is declared dead, in seconds.
+-   `priority`: The OSPF router priority for this interface.
 
 ### Example Configuration
 
@@ -55,13 +67,16 @@ Here is an example `ospf_sim.conf` file that defines a single router with two vi
 ```
 # OSPF Simulator Configuration
 
+[simulator]
+num_routers=1
+
 [router]
 router_id=2.2.2.2
 
 [interface]
 port=0
 mac=00:00:00:00:00:01
-ip=192.168.1.100
+ip=192.168.1.100,10.0.0.1
 netmask=255.255.255.0
 
 [interface]
