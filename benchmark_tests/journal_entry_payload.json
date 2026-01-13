@@ -1,0 +1,21 @@
+{
+  "userId": 1,
+  "organizationId": 1,
+  "date": "2024-07-29",
+  "reference": "REF-001",
+  "notes": "Test journal entry for benchmarking.",
+  "entries": [
+    {
+      "accountId": 101,
+      "debit": 100.00,
+      "credit": 0.00,
+      "description": "Debit to cash"
+    },
+    {
+      "accountId": 201,
+      "debit": 0.00,
+      "credit": 100.00,
+      "description": "Credit to revenue"
+    }
+  ]
+}
